@@ -1,0 +1,855 @@
+/* ============================ app.js ============================ */
+(function () {
+'use strict';
+const { Chem, Dock, Props } = window;
+const $ = s => document.querySelector(s);
+const tick = () => new Promise(r => setTimeout(r, 0));
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in props || {}) { const v = props[k];
+    if (k === 'on') for (const ev in v) e.addEventListener(ev, v[ev]);
+    else if (k === 'cls') e.className = v; else if (k === 'text') e.textContent = v; else if (k === 'html') e.innerHTML = v;
+    else if (['value', 'checked', 'disabled', 'selected', 'hidden'].includes(k)) e[k] = v; else if (v != null && v !== false) e.setAttribute(k, v); }
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c);
+  return e;
+}
+const f1 = v => (Math.round(v * 10) / 10).toFixed(1);
+/* ---- console: every step writes a timestamped line here ---- */
+const CON = { lines: [], open: false, prog: -1, pinned: false, t: 0 };
+/* energy unit: kcal/mol by default (Vina's own unit), kJ/mol on request; remembered per browser */
+let UNIT = 'kcal'; try { if (localStorage.getItem('cp-dock-unit') === 'kJ') UNIT = 'kJ'; } catch (e) {}
+const uVal = m => UNIT === 'kJ' ? m.kJ : m.kcal, uTxt = m => UNIT === 'kJ' ? f1(m.kJ) : m.kcal.toFixed(2), uName = () => UNIT === 'kJ' ? 'kJ/mol' : 'kcal/mol';
+const uAlt = m => UNIT === 'kJ' ? m.kcal.toFixed(2) + ' kcal/mol' : f1(m.kJ) + ' kJ/mol';
+/* console shows only while something runs; hides a few seconds after the last message unless pinned open */
+function conTouch() { const c = $('#con'); if (!c) return; c.classList.remove('hide'); clearTimeout(CON.t);
+  CON.t = setTimeout(() => { if (!A.running && !CON.pinned) c.classList.add('hide'); }, 4000); }
+function clog(msg, kind) {
+  const d = new Date(), ts = d.toTimeString().slice(0, 8);
+  CON.lines.push({ ts, msg: String(msg), kind: kind || '' }); if (CON.lines.length > 600) CON.lines.splice(0, CON.lines.length - 600);
+  const pre = $('#con-log'), last = $('#con-last'); if (!pre) return; conTouch();
+  const row = document.createElement('div'), s = document.createElement('span'); s.className = 'ts'; s.textContent = ts + '  ';
+  const m = document.createElement('span'); if (kind) m.className = kind; m.textContent = String(msg); row.append(s, m); pre.append(row);
+  while (pre.childNodes.length > 600) pre.removeChild(pre.firstChild);
+  pre.scrollTop = 1e9; last.textContent = String(msg).trim(); last.style.color = kind === 'err' ? 'var(--danger)' : '';
+}
+function conProgress(f) { const b = $('#con-bar'); if (!b) return; if (f == null || f < 0) { b.hidden = true; return; } b.hidden = false; b.firstChild.style.width = Math.round(f * 100) + '%'; }
+function conOpen(v) { CON.open = v; const c = $('#con'); c.classList.toggle('min', !v); $('#con-h').setAttribute('aria-expanded', String(v)); $('#con-chev').innerHTML = v ? '&#9660;' : '&#9650;'; const pre = $('#con-log'); if (v) pre.scrollTop = 1e9; }
+let toastT = 0;
+function toast(msg, ms = 4000) { clog(msg, /fail|could not|error|no protein|cannot/i.test(msg) ? 'err' : ''); const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, ms); }
+
+const STEPS = [['draw', 'Draw'], ['model', '3D and minimise'], ['rec', 'Target and pocket'], ['dock', 'Dock'], ['res', 'Results']];
+const A = {
+  step: 'draw', ligs: [], sel: null, nextId: 1, live: { comps: [], err: '' }, imported: 0,
+  recAtoms: null, recName: '', chains: [], selChains: new Set(), hets: [], keepHet: new Set(), rec: null, pockets: [], pocketSel: -1,
+  box: null, boxMode: 'auto', example: null, results: {}, running: false, cancel: false, progress: null, log: [], pose: { id: null, mode: 0 },
+  vw: { inter: true, H: true, trace: true, box: true, key: true, surf: false, only: false }, keyRes: new Map(), keyNear: new Set(), keyOff: new Set(), keyDist: 4, posePts: null, viewer: null, viewerErr: '', busy: '',
+  natives: [], check: null,
+  o: { selfFirst: false, runs: 32, effort: 1, modes: 9, rangeKJ: 12.6, spacing: 0.375, sd: 100, cg: 10, step: 0.02, conf: 10, conv: true }
+};
+const sel = () => A.ligs.find(l => l.id === A.sel) || null;
+/* Ligand selector text: "Ligand X - name", X = position in the library. The stored name stays editable and is shown without any "Ligand N" prefix. */
+const ligShort = l => (l.name || '').replace(/^Ligand\s*\d+\s*[-\u2013:]?\s*/i, '').trim() || l.fm || 'unnamed';
+const ligLabel = l => l.label || ('Ligand ' + (A.ligs.indexOf(l) + 1) + ' - ' + ligShort(l));
+const ligOf = id => id === 'selfcheck' ? (A.check && A.check.lig) : A.ligs.find(q => q.id === id), resOf = id => id === 'selfcheck' ? (A.check && A.check.res) : A.results[id];
+const dark = () => { const t = document.documentElement.dataset.theme; return t ? t === 'dark' : matchMedia('(prefers-color-scheme:dark)').matches; };
+const accentHex = () => dark() ? 0xd97757 : 0xc15f3c;
+
+/* ===================== files ===================== */
+async function saveFile(name, data) {
+  let dl = null; try { dl = await window.claude?.use?.('downloads'); } catch (e) {}
+  /* Only the Claude artifact viewer restricts file types (.pdb and .sdf are saved as .pdb.txt there). On the site the real name is kept. */
+  if (dl && !/\.(png|jpe?g|webp|gif|svg|csv|json|txt|md|html|pdf)$/i.test(name)) name += '.txt';
+  if (dl) { try { await dl.save({ filename: name, data }); toast('Saved ' + name); } catch (e) { toast(e && e.code === 'declined' ? 'Save cancelled.' : 'Could not save: ' + ((e && e.message) || 'unknown error')); } return; }
+  try { const b = data instanceof Blob ? data : new Blob([data], { type: 'text/plain' }), u = URL.createObjectURL(b), a = document.createElement('a'); a.href = u; a.download = name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 4000); toast('Saved ' + name); }
+  catch (e) { toast('Saving is blocked in this view.'); }
+}
+async function dataUrlBlob(u) { const i = u.indexOf(','), bin = atob(u.slice(i + 1)), buf = new Uint8Array(bin.length); for (let k = 0; k < bin.length; k++) buf[k] = bin.charCodeAt(k); return new Blob([buf], { type: (/^data:([^;,]+)/.exec(u) || [])[1] || 'image/png' }); }
+const snapH = w => { const e = $('#vhost'); return e && e.clientWidth ? Math.round(w * e.clientHeight / e.clientWidth) : Math.round(w * 0.75); };
+
+/* ===================== Molvex bridge =====================
+   Contract with molvex.html: a global function molfile() returning a V2000 molfile of the page.
+   If a future Molvex drops it, the editor's saved state in localStorage ('bondline.v1') is converted instead. */
+const BL = { frame: $('#bl'), last: null, ready: false, err: '' };
+function blWin() { try { return BL.frame.contentWindow; } catch (e) { return null; } }
+function storageMolfile(w) {
+  try {
+    const S = JSON.parse(w.localStorage.getItem('bondline.v1') || 'null'); if (!S || !S.o) return null;
+    const os = Object.values(S.o), as = os.filter(o => o.t === 'a'), bs = os.filter(o => o.t === 'b' && as.some(a => a.id === o.a) && as.some(a => a.id === o.b)), idx = {}; as.forEach((a, i) => idx[a.id] = i + 1);
+    const p = (v, n) => String(v).padStart(n), sc = 1.5 / 42; let m = '\n  Molvex\n\n' + p(as.length, 3) + p(bs.length, 3) + '  0  0  0  0  0  0  0  0999 V2000\n';
+    for (const a of as) m += p((a.x * sc).toFixed(4), 10) + p((-a.y * sc).toFixed(4), 10) + p('0.0000', 10) + ' ' + (a.custom ? 'A' : a.el).padEnd(3) + ' 0  0  0  0  0  0  0  0  0  0  0  0\n';
+    for (const b of bs) m += p(idx[b.a], 3) + p(idx[b.b], 3) + p(b.o, 3) + p(b.o === 1 ? (b.s === 'wedge' ? 1 : b.s === 'dash' ? 6 : b.s === 'wavy' ? 4 : 0) : 0, 3) + '  0  0  0\n';
+    const q = as.filter(a => a.q); for (let i = 0; i < q.length; i += 8) { const c = q.slice(i, i + 8); m += 'M  CHG' + p(c.length, 3) + c.map(a => p(idx[a.id], 4) + p(a.q, 4)).join('') + '\n'; }
+    return m + 'M  END\n';
+  } catch (e) { return null; }
+}
+function blMolfile() { const w = blWin(); if (!w) return null; try { if (typeof w.molfile === 'function') return w.molfile(); } catch (e) {} return storageMolfile(w); }
+async function loadMolvex() {
+  BL.frame.addEventListener('load', () => { BL.ready = true; syncBLTheme(); poll(); });
+  try { const r = await fetch('../molvex/index.html'); if (!r.ok) throw new Error('HTTP ' + r.status); BL.frame.srcdoc = await r.text(); }
+  catch (e) { BL.err = 'The Molvex editor could not be loaded (' + e.message + ').'; renderPanel(); }
+}
+function syncBLTheme() { const w = blWin(); try { if (w && w.document) { w.document.documentElement.dataset.theme = dark() ? 'dark' : 'light'; } } catch (e) {} }
+function parseLive(t) {
+  try {
+    const p = Chem.parseMol(t, { lenient: true });
+    const comps = Chem.splitComponents(p).map(c => { const custom = c.atoms.find(a => a.custom); let fm = '', mw = 0, err = '';
+      if (!custom) { try { const f = Chem.formula(Chem.prepare(c)); fm = f.text; mw = f.mass; } catch (e) { err = e.message; } }
+      return { parsed: c, custom, fm, mw, err, x: Math.min(...c.atoms.map(a => a.x)), y: -Math.min(...c.atoms.map(a => a.y)) }; });
+    comps.sort((a, b) => a.x - b.x || a.y - b.y); comps.forEach((c, i) => c.i = i);
+    A.live = { comps, err: '' };
+  } catch (e) { A.live = { comps: [], err: /no atoms/.test(e.message) ? '' : e.message }; }
+}
+function poll() { const t = blMolfile(); if (t == null || t === BL.last) return; BL.last = t; parseLive(t); renderLive(); }
+setInterval(poll, 700);
+
+/* ===================== ligand library ===================== */
+function addLigand(parsed, name, extra) {
+  const id = A.nextId++, l = Object.assign({ id, name: name || 'Ligand ' + id, parsed, mol: null, state: '2d', E: null, hist: [], parts: null, fm: '', mw: 0 }, extra || {});
+  try { const f = Chem.formula(l.mol || Chem.prepare(parsed)); l.fm = f.text; l.mw = f.mass; } catch (e) {}
+  A.ligs.push(l); if (A.sel == null) A.sel = id; clog('Added ' + ligLabel(l) + (l.fm ? ' (' + l.fm + ', ' + l.mw.toFixed(2) + ' g/mol)' : '')); return l;
+}
+function addFromDrawing(c) { return addLigand(c.parsed, null, { di: c.i }); }
+function convert3D(l) {
+  clog('Converting ' + ligLabel(l) + ' to 3D (' + A.o.conf + ' conformers)...');
+  const m = Chem.build3DFrom(l.parsed, { nconf: A.o.conf, seed: l.id * 17 + 3 });
+  l.mol = m; l.state = '3d'; l.E = m.E; l.hist = []; l.parts = null; l.dock = null; delete A.results[l.id];
+  const f = Chem.formula(m); l.fm = f.text; l.mw = f.mass; l.props = null;
+  clog('  ' + ligLabel(l) + ': ' + f.text + ', ' + m.atoms.length + ' atoms with hydrogens, force-field energy ' + m.E.toFixed(1) + ' kJ/mol', 'ok');
+}
+async function minimiseLig(l) {
+  if (!l.mol) convert3D(l); const m = l.mol; if (!m.T) m.T = Chem.buildTopology(m);
+  clog('Minimising ' + ligLabel(l) + '...');
+  const x = Chem.coords(m), o = A.o; let rounds = 0, prev = Infinity, hist = [], res, d;
+  do { res = Chem.minimize(x, m.T, { sd: o.sd, cg: o.cg, step: o.step }); hist.push(...res.hist); rounds++; d = prev - res.E; prev = res.E; await tick(); } while (o.conv && rounds < 40 && d > 0.05);
+  Chem.setCoords(m, x); l.E = res.E; l.parts = res.parts; l.state = 'min'; l.hist = (l.hist || []).concat(hist); l.rounds = rounds; l.dock = null; delete A.results[l.id];
+  clog('  ' + ligLabel(l) + ': ' + rounds + ' round' + (rounds > 1 ? 's' : '') + ', energy ' + res.E.toFixed(1) + ' kJ/mol', 'ok');
+}
+
+/* ===================== AutoDock-GPU hand-off ===================== */
+/* AutoDock-GPU is a native OpenCL/CUDA program with AutoDock4 scoring and AutoGrid4 maps. It cannot run inside a web page,
+   so this writes a job sheet with the search box and the commands, to run on a machine with a GPU. */
+function exportADGPU() {
+  const b = A.box; if (!b) return toast('Set the search box first.');
+  const sp = 0.375, np = b.s.map(v => { let n = Math.ceil(v / sp); return n + (n % 2); }), c = b.c.map(v => v.toFixed(3));
+  const names = A.ligs.map(l => ligLabel(l).replace(/\W+/g, '_'));
+  const txt = [
+    '# AutoDock-GPU job sheet from ' + cpName('rapiddock'),
+    '# Target: ' + (A.recName || 'target') + '   Ligands: ' + (names.join(', ') || 'none'),
+    '#',
+    '# AutoDock-GPU (https://github.com/forlilab/AutoDock-GPU) needs an OpenCL or CUDA GPU and uses AutoDock4 scoring,',
+    '# so its energies are not the same scale as the Vina-style scores in this page. Do not compare the two directly.',
+    '#',
+    '# 1. Search box from this session (Angstrom)',
+    'center  ' + c.join('  '),
+    'size    ' + b.s.map(v => v.toFixed(2)).join('  '),
+    'npts    ' + np.join('  ') + '   # grid points at 0.375 A spacing, rounded up to even numbers',
+    '#',
+    '# 2. Prepare files (not done here). Save the target and ligands from ' + cpName('rapiddock') + ' (PDB and SDF buttons), then make PDBQT files',
+    '#    with Meeko (https://meeko.readthedocs.io), which also assigns the charges and AutoDock atom types AutoGrid needs.',
+    '#',
+    '# 3. Grid parameter file (target.gpf): the lines that depend on this session. Meeko or AutoDockTools writes the rest',
+    '#    (receptor_types, ligand_types, map lines, smooth, dielectric).',
+    'npts ' + np.join(' '),
+    'gridfld target.maps.fld',
+    'spacing ' + sp,
+    'receptor target.pdbqt',
+    'gridcenter ' + c.join(' '),
+    '#',
+    '# 4. Run',
+    'autogrid4 -p target.gpf -l target.glg',
+    'adgpu --ffile target.maps.fld --lfile ligand.pdbqt --nrun 20',
+    '#    adgpu is the name used in the Meeko tutorial; the build may be called autodock_gpu_64wi (see the AutoDock-GPU README).',
+    '#    For many ligands: adgpu --ffile target.maps.fld --filelist ligands.txt',
+    ''
+  ].join('\n');
+  saveFile('autodock_gpu_job.txt', new Blob([txt], { type: 'text/plain' }));
+  clog('Wrote autodock_gpu_job.txt (box centre ' + c.join(', ') + '; ' + np.join(' x ') + ' points)', 'ok');
+}
+
+/* ===================== drug-likeness ===================== */
+function ligProps(l) {
+  if (l.props) return l.props;
+  try { l.props = Props.props(l.mol || Chem.prepare(l.parsed)); } catch (e) { l.props = { error: e.message }; }
+  return l.props;
+}
+function radarSVG(P) {
+  const R = 78, C = 110, n = P.radar.length, ns = 'http://www.w3.org/2000/svg', sv = document.createElementNS(ns, 'svg');
+  sv.setAttribute('viewBox', '-16 0 252 220'); sv.setAttribute('class', 'radar'); sv.setAttribute('role', 'img'); sv.setAttribute('aria-label', 'Oral bioavailability radar: ' + P.radarOk + ' of 6 properties in the optimal range');
+  const pt = (k, f) => { const a = -Math.PI / 2 + k * 2 * Math.PI / n; return [C + Math.cos(a) * R * f, C + Math.sin(a) * R * f]; };
+  const nz = (r, v) => Math.max(0, Math.min(1, (v - r.min) / (r.max - r.min)));
+  const poly = fs => fs.map((f, k) => pt(k, f).map(v => v.toFixed(1)).join(',')).join(' ');
+  const mk = (tag, at, txt) => { const e = document.createElementNS(ns, tag); for (const k in at) e.setAttribute(k, at[k]); if (txt != null) e.textContent = txt; sv.append(e); return e; };
+  [0.25, 0.5, 0.75, 1].forEach(f => mk('polygon', { class: 'ring', points: poly(P.radar.map(() => f)) }));
+  P.radar.forEach((r, k) => { const [x, y] = pt(k, 1); mk('line', { x1: C, y1: C, x2: x.toFixed(1), y2: y.toFixed(1), class: 'ring' }); });
+  const outer = P.radar.map(r => nz(r, r.hi)), inner = P.radar.map(r => nz(r, r.lo));
+  mk('path', { class: 'zone', d: 'M' + poly(outer).replace(/ /g, 'L') + 'Z M' + poly(inner).replace(/ /g, 'L') + 'Z' });
+  mk('polygon', { class: 'val', points: poly(P.radar.map(r => nz(r, r.val))) });
+  P.radar.forEach((r, k) => { const [x, y] = pt(k, 1.2); mk('text', { x: x.toFixed(1), y: (y + 3).toFixed(1), 'text-anchor': Math.abs(x - C) < 6 ? 'middle' : x > C ? 'start' : 'end', style: r.ok ? '' : 'fill:var(--warn)' }, r.key); });
+  return sv;
+}
+function propsCard(l) {
+  const box = h('div', { cls: 'sec' }); box.append(h('h3', { text: 'Drug-likeness · ' + ligLabel(l) }));
+  const P = ligProps(l); if (!P || P.error) { box.append(h('p', { cls: 'note', text: 'Could not compute properties' + (P ? ': ' + P.error : '.') })); return box; }
+  const chip = (ok, txt) => h('span', { cls: 'chip ' + (ok ? 'ok' : 'no'), text: txt });
+  const f = (v, d = 1) => v.toFixed(d), L = P.lipinski;
+  box.append(h('div', { cls: 'rules' },
+    h('span', { text: 'Molecular weight' }), h('span', { cls: 'v' }, f(P.mw, 2) + ' g/mol ', chip(L.mw, L.mw ? '≤ 500' : '> 500')),
+    h('span', { text: 'logP (MLOGP)' }), h('span', { cls: 'v' }, f(P.logp, 2) + ' ', chip(L.logp, L.logp ? '≤ 4.15' : '> 4.15')),
+    h('span', { text: 'H-bond acceptors (N + O)' }), h('span', { cls: 'v' }, P.hba + ' ', chip(L.hba, L.hba ? '≤ 10' : '> 10')),
+    h('span', { text: 'H-bond donors (NH + OH)' }), h('span', { cls: 'v' }, P.hbd + ' ', chip(L.hbd, L.hbd ? '≤ 5' : '> 5'))));
+  box.append(h('div', { cls: 'row' }, chip(L.pass, 'Lipinski: ' + (L.pass ? 'passes' : 'fails') + ' · ' + L.violations + ' violation' + (L.violations === 1 ? '' : 's')),
+    chip(P.veber.pass, 'Veber: ' + (P.veber.pass ? 'passes' : 'fails')), chip(P.egan.pass, 'Egan: ' + (P.egan.pass ? 'passes' : 'fails'))));
+  box.append(h('dl', { cls: 'kv' }, ...[['TPSA', f(P.tpsa, 1) + ' Å²'], ['Rotatable bonds', P.rb], ['Fraction Csp3', f(P.fsp3, 2)], ['Aromatic heavy atoms', P.arom + ' of ' + P.heavy], ['Solubility (ESOL)', f(P.logs, 2) + ' · ' + P.solClass], ['GI absorption', P.gi], ['Brain penetration', P.bbb]].flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { text: String(v) })])));
+  box.append(radarSVG(P), h('p', { cls: 'note', style: 'text-align:center', text: P.radarOk + ' of 6 properties inside the shaded optimal range (LIPO, SIZE, POLAR, INSOLU, INSATU, FLEX). Outside values are marked in amber.' }),
+    h('p', { cls: 'note', text: 'Estimates computed in your browser. TPSA follows Ertl, logP is Moriguchi MLOGP, solubility is Delaney ESOL, and the radar uses the same windows as SwissADME. SwissADME averages five logP models and uses XLOGP3 and WLOGP for some rules, so its numbers will differ a little. Egan here uses MLOGP in place of WLOGP. GI and brain flags are simple heuristics (TPSA, size, donors), not the BOILED-Egg model.' }));
+  return box;
+}
+
+/* ===================== receptor ===================== */
+async function loadReceptorText(text, name) {
+  A.check = null; A.scSel = null; A.hetNames = {};
+  for (const m of text.matchAll(/^HETNAM\s+(?:\d+\s+)?(\w{1,3})\s+(.+)$/gm)) A.hetNames[m[1]] = ((A.hetNames[m[1]] || '') + ' ' + m[2].trim()).trim();
+  const atoms = Dock.parsePDB(text);
+  if (!atoms.some(a => !a.het || Dock.STD.has(a.res))) { toast('No protein atoms found in that file.'); return; }
+  A.busy = 'Reading structure'; renderPanel(); await tick();
+  clog('Reading target ' + name + ': ' + atoms.length.toLocaleString() + ' atoms');
+  A.recAtoms = atoms; A.recName = name;
+  A.chains = [...new Set(atoms.filter(a => !a.het || Dock.STD.has(a.res)).map(a => a.chain))]; A.selChains = new Set(A.chains);
+  A.hets = Dock.hetGroups(atoms).filter(g => !Dock.STD.has(g.res)); A.keepHet = new Set(); A.results = {}; A.box = null; A.keyRes = new Map(); A.keyNear = new Set(); A.keyOff = new Set();
+  await prepRec();
+}
+async function prepRec() {
+  A.busy = 'Preparing target and searching for pockets'; renderPanel(); await tick();
+  clog('Preparing target (chains ' + [...A.selChains].join(', ') + ')...');
+  A.rec = Dock.prepareReceptor(A.recAtoms, { chains: [...A.selChains], keepHet: [...A.keepHet] }); A.pockets = [];
+  await tick();
+  clog('Searching for pockets...');
+  try { A.pockets = Dock.findPockets(A.rec); } catch (e) { A.pockets = []; }
+  clog('  ' + A.pockets.length + ' pocket' + (A.pockets.length === 1 ? '' : 's') + ' found', 'ok');
+  if (!A.box) { if (A.example && A.recName.startsWith('1IEP')) useExampleSite(); else if (A.hets.some(g => g.nHeavy >= 5)) useHet(A.hets.filter(g => g.nHeavy >= 5).sort((p, q) => q.nHeavy - p.nHeavy)[0]); else if (A.pockets.length) usePocket(0); else { const c = Dock.centroid(A.rec.meta.map((m, i) => ({ x: A.rec.X[3*i], y: A.rec.X[3*i+1], z: A.rec.X[3*i+2] }))); A.box = { c, s: [30, 30, 30] }; A.boxMode = 'manual'; } }
+  A.busy = ''; refreshAll();
+}
+function usePocket(i) { const p = A.pockets[i]; if (!p) return; A.pocketSel = i; A.boxMode = 'auto'; A.box = { c: p.box.c.slice(), s: p.box.s.slice() }; }
+function useExampleSite() { if (!A.example) return; A.boxMode = 'site'; A.pocketSel = -1; A.box = Dock.boxFromPoints(A.example.heavy, 12, 20); }
+function useHet(g) { A.boxMode = 'site'; A.pocketSel = -1; A.box = Dock.boxFromPoints(g.atoms.filter(a => a.el !== 'H').map(a => [a.x, a.y, a.z]), 12, 20); }
+function useResidues(txt) {
+  const rec = A.rec; if (!rec) return; const toks = txt.split(/[,\s;]+/).filter(Boolean), pts = [];
+  for (const t of toks) { const m = /^(?:([A-Za-z0-9]):)?(\d+)(?:-(\d+))?$/.exec(t); if (!m) { toast('Could not read "' + t + '". Use A:381 or 315-320.'); return; }
+    const lo = +m[2], hi = m[3] ? +m[3] : lo; rec.meta.forEach((a, i) => { if ((!m[1] || a.chain === m[1]) && a.resi >= lo && a.resi <= hi) pts.push([rec.X[3*i], rec.X[3*i+1], rec.X[3*i+2]]); }); }
+  if (!pts.length) { toast('No target atoms match those residues.'); return; }
+  A.boxMode = 'res'; A.pocketSel = -1; A.box = Dock.boxFromPoints(pts, 12, 18); refreshAll();
+}
+async function loadExample() {
+  try {
+    A.busy = 'Loading ABL kinase example'; renderPanel();
+    const [p, s] = await Promise.all([fetch('data/1iep.pdb').then(r => { if (!r.ok) throw new Error('1iep.pdb ' + r.status); return r.text(); }), fetch('data/imatinib.sdf').then(r => { if (!r.ok) throw new Error('imatinib.sdf ' + r.status); return r.text(); })]);
+    const parsed = Chem.parseMol(s), mol = Chem.prepare(parsed);
+    A.example = { name: 'imatinib (crystal pose)', sdf: s, parsed, mol, heavy: mol.atoms.filter(a => !a.h && a.el !== 'H').map(a => [a.x, a.y, a.z]) };
+    await loadReceptorText(p, '1IEP ABL kinase (target, hydrogens added)');
+  } catch (e) { A.busy = ''; toast('Could not load the example: ' + e.message); renderPanel(); }
+}
+function addExampleLigand() {
+  if (!A.example) return; const ex = A.example; let l = A.ligs.find(q => q.crystal); if (l) { A.sel = l.id; return l; }
+  const mol = Chem.prepare(Chem.parseMol(ex.sdf)); mol.T = Chem.buildTopology(mol);
+  l = addLigand(Chem.parseMol(ex.sdf), 'Imatinib (crystal pose)', { mol, state: '3d', E: Chem.energy(Chem.coords(mol), mol.T), crystal: true, ref: mol.atoms.map(a => [a.x, a.y, a.z]) });
+  const f = Chem.formula(mol); l.fm = f.text; l.mw = f.mass; A.sel = l.id; return l;
+}
+
+/* ===================== docking ===================== */
+function ligForDock(l) { if (!l.mol) convert3D(l); return Dock.prepareLigand(l.mol); }
+async function runDocking() {
+  const todo = A.ligs.filter(l => l.dockOn !== false); if (!todo.length) return toast('Add and tick at least one ligand.');
+  if (!A.rec) return toast('Load a target first.'); if (!A.box) return toast('Define the search box first.');
+  if (A.o.selfFirst && scCandidates().length) { const sc = await selfCheck(); if (sc === 'cancelled' || sc === 'busy') return; if (sc === 'fail') clog('Self-check did not reach ' + RMSD_LIMIT + ' Å. Docking continues, but read the scores with care.', 'err'); }
+  A.running = true; A.cancel = false; A.log = []; A.progress = { grid: 0, lig: 0, name: '', i: 0, n: todo.length }; renderPanel(); refreshView();
+  const log = m => clog(m); conOpen(true); clog('--- Docking run started: ' + todo.length + ' ligand' + (todo.length > 1 ? 's' : '') + ', exhaustiveness ' + A.o.runs + ', effort ' + A.o.effort + ' ---');
+  const prog = () => { const p = A.progress; const g = $('#pg-grid'), r = $('#pg-lig'), t = $('#pg-txt'); if (g) g.style.width = (p.grid * 100) + '%'; if (r) r.style.width = (p.lig * 100) + '%'; if (t) t.textContent = p.name ? p.name + ' (' + (p.i + 1) + ' of ' + p.n + ')' : ''; };
+  try {
+    const ligs = [];
+    for (const l of todo) { try { ligs.push({ l, d: ligForDock(l) }); } catch (e) { log('Skipped ' + ligLabel(l) + ': ' + e.message); } }
+    const keys = [...new Set(ligs.flatMap(x => x.d.types.filter(Boolean)))];
+    const nPts = A.box.s.map(v => Math.ceil(v / A.o.spacing) + 1).reduce((a, b) => a * b, 1);
+    log('Grid maps: ' + keys.length + ' atom types, ' + nPts.toLocaleString() + ' points per map, spacing ' + A.o.spacing + ' Å');
+    const t0 = performance.now();
+    let gm = -1; const G = await Dock.buildGrids(A.rec, A.box, keys, { spacing: A.o.spacing }, p => { A.progress.grid = p; prog(); conProgress(p); const m = Math.floor(p * 4); if (m > gm) { gm = m; log('  grid maps ' + Math.round(p * 100) + '%'); } }, () => A.cancel);
+    log('Grids ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s (' + G.nNear + ' target atoms in range)');
+    for (let k = 0; k < ligs.length; k++) {
+      const { l, d } = ligs[k]; A.progress.i = k; A.progress.name = ligLabel(l); A.progress.lig = 0; prog(); const t1 = performance.now();
+      log(ligLabel(l) + ': ' + d.nh + ' heavy atoms, ' + d.nt + ' rotatable bonds');
+      let lm = -1;
+      const res = await Dock.dockLigand(d, G, { runs: A.o.runs, effort: A.o.effort, modes: A.o.modes, range: A.o.rangeKJ / 4.184, seed: (A.check ? A.check.fin.seed : 1) + k }, { progress: f => { A.progress.lig = f; prog(); conProgress(f); const m = Math.floor(f * 5); if (m > lm) { lm = m; log('  ' + ligLabel(l) + ' search ' + Math.round(f * 100) + '%'); } }, cancelled: () => A.cancel });
+      l.dock = d; res.modes.forEach(m => { m.inter = Dock.interactions(d, A.rec, m.pos); if (l.ref) m.rmsdRef = Dock.symRmsd(d, m.pos, l.ref); });
+      A.results[l.id] = { modes: res.modes, nrot: res.nrot, time: (performance.now() - t1) / 1000, runs: res.runs, steps: res.steps };
+      const b = res.modes[0]; log('  best ' + f1(b.kJ) + ' kJ/mol (' + b.kcal.toFixed(2) + ' kcal/mol), ' + res.modes.length + ' modes, ' + A.results[l.id].time.toFixed(1) + ' s' + (b.rmsdRef != null ? ', RMSD to crystal ' + b.rmsdRef.toFixed(2) + ' Å' : ''));
+      A.pose = { id: l.id, mode: 0 }; conProgress(-1); log('  rendering ' + res.modes.length + ' pose images...');
+      for (let m = 0; m < res.modes.length; m++) { showPose(l, res.modes[m], true); res.modes[m].img = A.viewer.snapshot(336, 252); await tick(); }
+    }
+    A.running = false; conProgress(-1); clog('--- Docking finished: ' + ligs.length + ' ligand' + (ligs.length > 1 ? 's' : '') + ' ---', 'ok'); A.step = 'res'; const first = ligs[0] && ligs[0].l; if (first) { A.sel = first.id; A.pose = { id: first.id, mode: 0 }; }
+    refreshAll();
+  } catch (e) { A.running = false; conProgress(-1); conTouch(); if (e.message === 'cancelled') { toast('Docking cancelled.'); } else { console.error(e); toast('Docking failed: ' + e.message, 7000); } refreshAll(); }
+}
+function refRmsd(d, pos, ref) { let s = 0, n = 0; for (const i of d.heavy) { const dx = pos[3*i] - ref[i][0], dy = pos[3*i+1] - ref[i][1], dz = pos[3*i+2] - ref[i][2]; s += dx*dx + dy*dy + dz*dz; n++; } return Math.sqrt(s / n); }
+
+/* ===================== viewer scene ===================== */
+function ensureViewer() {
+  if (A.viewer || A.viewerErr) return A.viewer;
+  try { A.viewer = new window.Viewer($('#vhost')); A.viewer.dark = dark(); } catch (e) { A.viewerErr = 'The 3D view needs WebGL, which is not available here (' + e.message + ').'; }
+  return A.viewer;
+}
+
+/* ===================== key residues ===================== */
+const keyId = (c, n) => (c || '') + ':' + n;
+const KEY_DIST = [3.5, 4, 5, 6];
+function keySources() {
+  const out = [];
+  if (A.step === 'res' && A.posePts) out.push({ id: 'pose', name: 'the docked pose', pts: A.posePts });
+  if (A.example && A.recName.startsWith('1IEP')) out.push({ id: 'ex', name: A.example.name, pts: A.example.heavy });
+  for (const g of A.natives) out.push({ id: 'nat:' + g.id, name: g.name, pts: g.heavy });
+  for (const g of A.hets || []) if (g.nHeavy >= 5) out.push({ id: 'het:' + g.chain + g.res + g.resi, name: hetLabel(g), pts: g.atoms.filter(q => q.el !== 'H').map(q => [q.x, q.y, q.z]) });
+  return out;
+}
+function nearResidues(pts, d) {
+  const rec = A.rec, d2 = d * d, out = new Map(); if (!rec) return out;
+  for (let i = 0; i < rec.n; i++) { const m = rec.meta[i]; if (m.het) continue; const k = keyId(m.chain, m.resi); if (out.has(k)) continue; const x = rec.X[3*i], y = rec.X[3*i+1], z = rec.X[3*i+2];
+    for (const p of pts) { const dx = x - p[0], dy = y - p[1], dz = z - p[2]; if (dx*dx + dy*dy + dz*dz < d2) { out.set(k, { chain: m.chain, resi: m.resi, res: m.res }); break; } } }
+  return out;
+}
+function effectiveKeys() {
+  const eff = new Map(A.keyRes), near = new Map();
+  for (const s of keySources()) if (A.keyNear.has(s.id)) for (const [k, r] of nearResidues(s.pts, A.keyDist)) { near.set(k, s.name); if (!A.keyOff.has(k)) eff.set(k, r); }
+  return { eff, near };
+}
+/* Key residues for the interaction list: residues within the key distance of the natural ligand (example, bound ligand, kept or listed HETATM groups) plus any ticked by hand. */
+function nativeKeys() {
+  const out = new Map(); if (!A.rec) return out;
+  for (const s of keySources()) { if (s.id === 'pose') continue; for (const [k, r] of nearResidues(s.pts, A.keyDist)) if (!A.keyOff.has(k)) out.set(k, r); }
+  for (const [k, r] of A.keyRes) out.set(k, r);
+  return out;
+}
+function addKeyResidues(txt) {
+  const rec = A.rec; if (!rec) return 0; let added = 0;
+  for (const t of txt.split(/[,\s;]+/).filter(Boolean)) {
+    const m = /^(?:([A-Za-z0-9]):)?([A-Za-z]{3})?(\d+)(?:-(\d+))?$/.exec(t); if (!m) { toast('Could not read "' + t + '". Use A:381 or 315-320.'); continue; }
+    const lo = +m[3], hi = m[4] ? +m[4] : lo, seen = new Set();
+    for (let i = 0; i < rec.n; i++) { const a = rec.meta[i]; if (a.het || a.resi < lo || a.resi > hi || (m[1] && a.chain !== m[1]) || (m[2] && a.res !== m[2].toUpperCase())) continue;
+      const k = keyId(a.chain, a.resi); if (seen.has(k)) continue; seen.add(k); A.keyOff.delete(k); if (!A.keyRes.has(k)) { A.keyRes.set(k, { chain: a.chain, resi: a.resi, res: a.res }); added++; } }
+    if (!seen.size) toast('No residue matches "' + t + '".');
+  }
+  return added;
+}
+function drawKey(V) {
+  const E = A.rec && A.vw.key ? effectiveKeys().eff : null;
+  if (!E || !E.size) { V.clearLayer('key'); V.clearLayer('keylbl'); return; }
+  const rec = A.rec, idx = [], lbl = [], seen = new Set();
+  for (let i = 0; i < rec.n; i++) { const a = rec.meta[i], k = keyId(a.chain, a.resi); if (!E.has(k)) continue; idx.push(i);
+    if (!seen.has(k) && a.name === 'CA') { seen.add(k); lbl.push({ p: [rec.X[3*i], rec.X[3*i+1], rec.X[3*i+2]], text: a.res + a.resi }); } }
+  const map = new Map(); idx.forEach((i, k) => map.set(i, k)); const pos = new Float32Array(idx.length * 3), el = idx.map(i => rec.meta[i].el);
+  idx.forEach((i, k) => { pos[3*k] = rec.X[3*i]; pos[3*k+1] = rec.X[3*i+1]; pos[3*k+2] = rec.X[3*i+2]; });
+  const bonds = []; for (let b = 0; b < rec.bonds.length; b += 2) { const p = map.get(rec.bonds[b]), q = map.get(rec.bonds[b+1]); if (p !== undefined && q !== undefined) bonds.push(p, q); }
+  V.sticks('key', { pos, el, bonds, carbon: dark() ? 0xff7ab0 : 0xd6336c, ball: 0.26, stick: 0.14, skip: A.vw.H ? null : (i => el[i] === 'H') });
+  V.labels('keylbl', lbl, dark() ? '#ff8fbd' : '#c2255c');
+}
+function keyPanel() {
+  const rec = A.rec, { eff, near } = effectiveKeys(), srcs = keySources();
+  const sec = h('div', { cls: 'sec' }, h('h3', { text: 'Key residues' }));
+  if (srcs.length) {
+    sec.append(h('div', { cls: 'row' }, h('label', { text: 'Within', style: 'min-width:0' }),
+      h('select', { 'aria-label': 'Distance', style: 'flex:0 0 76px', on: { change: e => { A.keyDist = +e.target.value; A.keyOff.clear(); refreshAll(); } } }, ...KEY_DIST.map(d => h('option', { value: d, selected: d === A.keyDist, text: d + ' Å' }))), h('span', { cls: 'note', text: 'of a ligand:' })));
+    for (const s of srcs) { const n = nearResidues(s.pts, A.keyDist).size;
+      sec.append(h('label', { cls: 'chk', style: 'align-items:flex-start' }, h('input', { type: 'checkbox', checked: A.keyNear.has(s.id), on: { change: e => { if (e.target.checked) A.keyNear.add(s.id); else A.keyNear.delete(s.id); A.keyOff.clear(); refreshAll(); } } }), h('span', { text: 'Residues around ' + s.name + ' (' + n + ')' }))); }
+  } else sec.append(h('p', { cls: 'note', text: 'No ligand in this file to select around. Tick residues below or add them by number.' }));
+  // candidate list: residues inside the search box plus anything already highlighted
+  const cand = new Map(eff), b = A.box;
+  if (b) for (let i = 0; i < rec.n; i++) { const m = rec.meta[i]; if (m.het) continue; let ok = true; for (let q = 0; q < 3; q++) if (Math.abs(rec.X[3*i+q] - b.c[q]) > b.s[q] / 2 + 1) { ok = false; break; } if (ok) cand.set(keyId(m.chain, m.resi), { chain: m.chain, resi: m.resi, res: m.res }); }
+  const rows = [...cand.entries()].sort((x, y) => (eff.has(y[0]) - eff.has(x[0])) || (x[1].chain < y[1].chain ? -1 : x[1].chain > y[1].chain ? 1 : x[1].resi - y[1].resi));
+  const filt = h('input', { type: 'text', placeholder: 'Filter, e.g. THR or 315', 'aria-label': 'Filter residues', style: 'flex:1;min-width:0;height:28px;border:1px solid var(--line);background:var(--paper);border-radius:6px;padding:0 7px' });
+  const list = h('div', { cls: 'list', style: 'max-height:210px;overflow-y:auto' });
+  for (const [k, r] of rows) {
+    const on = eff.has(k), label = r.res + r.resi + (A.chains.length > 1 ? ' · chain ' + r.chain : '');
+    const row = h('label', { cls: 'item', 'data-q': (r.res + r.resi).toLowerCase() }, h('input', { type: 'checkbox', checked: on, 'aria-label': label, style: 'accent-color:var(--accent)', on: { change: e => {
+      if (e.target.checked) { A.keyOff.delete(k); A.keyRes.set(k, r); } else { A.keyRes.delete(k); if (near.has(k)) A.keyOff.add(k); } refreshView(); } } }),
+      h('span', { cls: 'nm', text: label }), near.has(k) ? h('span', { cls: 'chip', text: 'near ' + near.get(k) }) : null);
+    list.append(row);
+  }
+  filt.addEventListener('input', () => { const q = filt.value.trim().toLowerCase(); for (const r of list.children) r.hidden = q && !r.dataset.q.includes(q); });
+  sec.append(h('div', { cls: 'row' }, filt, h('button', { cls: 'btn sm', type: 'button', text: 'Clear all', disabled: !eff.size && !A.keyNear.size, on: { click: () => { A.keyRes.clear(); A.keyNear.clear(); A.keyOff.clear(); refreshAll(); } } })),
+    rows.length ? list : h('p', { cls: 'note', text: 'Set the search box to list the residues inside it.' }),
+    h('p', { cls: 'note', text: eff.size + ' highlighted. Ticking a row also works while you rotate the view.' }));
+  const inp = h('input', { type: 'text', placeholder: 'A:381, 315-320, THR315', 'aria-label': 'Add residues by number', on: { keydown: e => { if (e.key === 'Enter') add(); } } });
+  const add = () => { addKeyResidues(inp.value); refreshAll(); };
+  sec.append(h('details', {}, h('summary', { text: 'Add by residue number' }), h('div', { cls: 'row', style: 'margin-top:6px' }, inp, h('button', { cls: 'btn', text: 'Add', on: { click: add } }))));
+  return sec;
+}
+
+/* ===================== surface and selected-only ===================== */
+const VDW = { C: 1.7, N: 1.55, O: 1.52, S: 1.8, P: 1.8, F: 1.47, Cl: 1.75, Br: 1.85, Zn: 1.4, Mg: 1.4, Fe: 1.4, Ca: 1.7 };
+const onlyOn = () => A.vw.only && !!A.rec && effectiveKeys().eff.size > 0;
+let surfJob = 0;
+function drawSurface(V) {
+  const b = A.box; if (!A.rec || !A.vw.surf || onlyOn() || !b) { surfJob++; V.clearLayer('surf'); return; }
+  const key = [A.rec.n, ...b.c, ...b.s].map(v => typeof v === 'number' ? v.toFixed(2) : v).join('|');
+  if (V.layers.surf && V.layers.surf.__key === key) return;
+  const job = ++surfJob; toast('Building surface…');
+  setTimeout(() => { // let the toast paint first; the build blocks for a second or two
+    if (job !== surfJob || !A.rec || !A.vw.surf) return;
+    const m = 20, lo = [0, 1, 2].map(q => b.c[q] - b.s[q] / 2 - m), hi = [0, 1, 2].map(q => b.c[q] + b.s[q] / 2 + m), rec = A.rec, pts = [], rad = [], cls = [], CL = { N: 1, O: 2, S: 3 };
+    for (let i = 0; i < rec.n; i++) { const t = rec.meta[i]; if (t.el === 'H') continue; const x = rec.X[3*i], y = rec.X[3*i+1], z = rec.X[3*i+2];
+      if (x < lo[0] - 5 || x > hi[0] + 5 || y < lo[1] - 5 || y > hi[1] + 5 || z < lo[2] - 5 || z > hi[2] + 5) continue; pts.push(x, y, z); rad.push(VDW[t.el] || 1.7); cls.push(CL[t.el] || 0); }
+    V.surface('surf', new Float32Array(pts), new Float32Array(rad), lo, hi, { h: 0.6, cls: Uint8Array.from(cls) });
+    if (V.layers.surf) V.layers.surf.__key = key; const tt = $('#toast'); if (tt) tt.hidden = true;
+  }, 30);
+}
+function molSticks(V, name, mol, pos, opt = {}) {
+  const el = mol.atoms.map(a => a.el), bonds = []; mol.bonds.forEach(b => bonds.push(b.a, b.b));
+  V.sticks(name, { pos, el, bonds, carbon: opt.carbon ?? accentHex(), ball: opt.ball ?? 0.3, stick: opt.stick ?? 0.14, skip: A.vw.H ? null : (i => el[i] === 'H') });
+}
+function molPos(mol) { const p = new Float32Array(mol.atoms.length * 3); mol.atoms.forEach((a, i) => { p[3*i] = a.x; p[3*i+1] = a.y; p[3*i+2] = a.z; }); return p; }
+function recSticks(V, name, idxs, carbon, ball, stick) {
+  const rec = A.rec, map = new Map(); idxs.forEach((i, k) => map.set(i, k)); const pos = new Float32Array(idxs.length * 3), el = [];
+  idxs.forEach((i, k) => { pos[3*k] = rec.X[3*i]; pos[3*k+1] = rec.X[3*i+1]; pos[3*k+2] = rec.X[3*i+2]; el.push(rec.meta[i].el); });
+  const bonds = []; for (let b = 0; b < rec.bonds.length; b += 2) { const a = map.get(rec.bonds[b]), c = map.get(rec.bonds[b+1]); if (a !== undefined && c !== undefined) bonds.push(a, c); }
+  V.sticks(name, { pos, el, bonds, carbon: carbon ?? (dark() ? 0x8e9aa6 : 0x7c8a97), ball: ball ?? 0.17, stick: stick ?? 0.09 });
+}
+function residuesNear(pts, d) {
+  const rec = A.rec, keys = new Set(), d2 = d * d; for (let i = 0; i < rec.n; i++) { const x = rec.X[3*i], y = rec.X[3*i+1], z = rec.X[3*i+2];
+    for (const p of pts) { const dx = x - p[0], dy = y - p[1], dz = z - p[2]; if (dx*dx + dy*dy + dz*dz < d2) { keys.add(rec.meta[i].chain + rec.meta[i].resi); break; } } }
+  const out = []; for (let i = 0; i < rec.n; i++) if (keys.has(rec.meta[i].chain + rec.meta[i].resi)) out.push(i); return out;
+}
+const ixCol = () => dark() ? { hbond: 0x4aa8ff, hydrophobic: 0x6fd17f, pipi: 0xc08cff } : { hbond: 0x0044cc, hydrophobic: 0x0a7a1c, pipi: 0x7a14c8 };
+function showPose(l, m, quiet) {
+  const V = ensureViewer(); if (!V || !l.dock) return; const d = l.dock, mol = d.mol, pos = m.pos;
+  const hp = d.heavy.map(i => [pos[3*i], pos[3*i+1], pos[3*i+2]]), c = Dock.centroid(hp.map(p => ({ x: p[0], y: p[1], z: p[2] })));
+  A.posePts = hp; V.clearLayer('box'); V.clearLayer('pts'); V.clearLayer('ref');
+  const only = !quiet && onlyOn(); if (A.vw.trace && !V.layers.trace) V.trace('trace', A.rec); const surfOn = !quiet && A.vw.surf; V.show('trace', A.vw.trace && !only && !surfOn);
+  if (only || surfOn) V.clearLayer('pocket'); else recSticks(V, 'pocket', residuesNear(hp, 5.5)); molSticks(V, 'lig', mol, pos);
+  if (l.id === 'selfcheck' && l.ref) { const rp = new Float32Array(l.ref.length * 3); l.ref.forEach((p, i) => { rp[3*i] = p[0]; rp[3*i+1] = p[1]; rp[3*i+2] = p[2]; }); molSticks(V, 'ref', mol, rp, { carbon: dark() ? 0xe6e6e6 : 0x3a3a3a, ball: 0.1, stick: 0.055 }); }
+  if (quiet) V.clearLayer('surf'); else drawSurface(V);
+  const IL = A.vw.inter ? (m.inter.list || []) : [], seg = t => IL.filter(x => x.type === t).map(x => [x.p1, x.p2]);
+  const hk = A.hiRes && IL.some(x => keyId(x.chain, x.resi) === A.hiRes) ? A.hiRes : null; if (!hk) A.hiRes = null;
+  const segs = (t, on) => IL.filter(x => x.type === t && (hk ? (keyId(x.chain, x.resi) === hk) === on : !on)).map(x => [x.p1, x.p2]), C = ixCol();
+  V.dashes('hb', segs('hbond', false), C.hbond, hk ? 0.06 : 0.085, hk ? 0.35 : 1); V.dashes('hy', segs('hydrophobic', false), C.hydrophobic, hk ? 0.05 : 0.07, hk ? 0.35 : 1); V.dashes('pp', segs('pipi', false), C.pipi, hk ? 0.06 : 0.09, hk ? 0.35 : 1);
+  if (hk) { V.dashes('hl', [...segs('hbond', true).map(x => [x, C.hbond]), ...segs('hydrophobic', true).map(x => [x, C.hydrophobic]), ...segs('pipi', true).map(x => [x, C.pipi])].map(x => x[0]), HILITE, 0.15);
+    const rec = A.rec, idx = []; for (let i = 0; i < rec.n; i++) if (keyId(rec.meta[i].chain, rec.meta[i].resi) === hk) idx.push(i);
+    recSticks(V, 'hires', idx, HILITE, 0.3, 0.16);
+    const ca = idx.find(i => rec.meta[i].name === 'CA') ?? idx[0], mt = rec.meta[ca]; V.labels('hilbl', [{ p: [rec.X[3*ca], rec.X[3*ca+1], rec.X[3*ca+2]], text: mt.res + mt.resi }], dark() ? '#00ff40' : '#00a62a'); }
+  else ['hl', 'hires', 'hilbl'].forEach(n => V.clearLayer(n));
+  let r = 0; hp.forEach(p => { r = Math.max(r, Math.hypot(p[0]-c[0], p[1]-c[1], p[2]-c[2])); });
+  drawKey(V); V.frame(c, r + 3.5); V.slab = (surfOn && !only) ? 120 : r + 8; V._cam();
+  if (!quiet) { const e = $('#vinfo'); e.replaceChildren(h('span', { text: ligLabel(l) + ' · mode ' + m.rank + ' · ' + uTxt(m) + ' ' + uName() }), h('span', { text: A.vw.inter ? m.inter.hbonds.length + ' H-bonds (blue) · ' + m.inter.hydRes + ' hydrophobic (green) · ' + m.inter.pipi + ' π–π (purple)' : 'interactions hidden' })); }
+}
+function refreshView() {
+  const draw = A.step === 'draw'; $('#paneDraw').hidden = !draw; $('#paneView').hidden = draw; const tools = $('#vtools'), info = $('#vinfo'), empty = $('#vempty'); tools.replaceChildren(); info.replaceChildren(); empty.hidden = true;
+  if (draw) return;
+  const V = ensureViewer(); if (!V) { empty.hidden = false; empty.textContent = A.viewerErr; return; } V.dark = dark(); V.resize();
+  const tb = (t, fn, on) => h('button', { cls: 'btn sm' + (on ? ' pri' : ''), text: t, on: { click: fn } });
+  tools.append(tb('Reset view', () => { V.resetRotation(); refreshView(); }), tb('H', () => { A.vw.H = !A.vw.H; refreshView(); }, A.vw.H), ...(A.step === 'res' ? [tb('Interactions', () => { A.vw.inter = !A.vw.inter; refreshView(); }, A.vw.inter)] : []), tb('Protein', () => { A.vw.trace = !A.vw.trace; refreshView(); }, A.vw.trace), tb('Box', () => { A.vw.box = !A.vw.box; refreshView(); }, A.vw.box), ...(A.rec ? [...(A.vw.surf ? [h('span', { cls: 'chip', text: 'Cut' }), h('input', { type: 'range', min: -12, max: 12, step: 0.5, value: V.cut, title: 'Cut depth through the surface', 'aria-label': 'Surface cut depth', style: 'width:84px;accent-color:var(--accent)', on: { input: e => { V.cut = +e.target.value; V.dirty = true; } } })] : []), tb('Surface', () => { A.vw.surf = !A.vw.surf; refreshView(); }, A.vw.surf), tb('Selected only', () => { if (!effectiveKeys().eff.size) { toast('Highlight some residues first.'); return; } A.vw.only = !A.vw.only; refreshView(); }, A.vw.only), tb('Key', () => { A.vw.key = !A.vw.key; refreshView(); }, A.vw.key)] : []),
+    tb('Save image', async () => { const u = V.snapshot(1600, snapH(1600)); saveFile(cpName('rapiddock').toLowerCase().replace(/\W+/g, '-') + '.png', await dataUrlBlob(u)); }));
+  if (A.step === 'model') {
+    ['trace', 'pocket', 'box', 'pts', 'hb', 'hy', 'pp', 'hl', 'hires', 'hilbl', 'ref'].forEach(n => V.clearLayer(n)); const l = sel();
+    if (!l || !l.mol) { V.clearLayer('lig'); empty.hidden = false; empty.textContent = l ? 'Convert the structure to 3D to see it here.' : 'Add a structure from the Draw step.'; return; }
+    const pos = molPos(l.mol); molSticks(V, 'lig', l.mol, pos); const c = [0, 1, 2].map(q => { let s = 0; for (let i = 0; i < l.mol.atoms.length; i++) s += pos[3*i+q]; return s / l.mol.atoms.length; });
+    let r = 0; for (let i = 0; i < l.mol.atoms.length; i++) r = Math.max(r, Math.hypot(pos[3*i]-c[0], pos[3*i+1]-c[1], pos[3*i+2]-c[2])); V.frame(c, r + 2);
+    info.append(h('span', { text: ligLabel(l) + ' · ' + l.fm }), h('span', { text: 'E = ' + f1(l.E) + ' kJ/mol' + (l.state === 'min' ? ' (minimised)' : '') }));
+    return;
+  }
+  if (A.step === 'rec' || A.step === 'dock') {
+    ['lig', 'hb', 'hy', 'pp', 'hl', 'hires', 'hilbl'].forEach(n => V.clearLayer(n)); if (!A.rec) { ['trace', 'pocket', 'box', 'pts', 'ref', 'key', 'keylbl', 'surf'].forEach(n => V.clearLayer(n)); empty.hidden = false; empty.textContent = 'Load a target to see it here.'; return; }
+    if (!V.layers.trace || V.layers.trace.__rec !== A.rec) { V.trace('trace', A.rec); V.layers.trace.__rec = A.rec; } V.show('trace', A.vw.trace && !onlyOn() && !A.vw.surf);
+    const b = A.box, idx = []; for (let i = 0; i < A.rec.n; i++) { let ok = true; for (let q = 0; q < 3; q++) if (Math.abs(A.rec.X[3*i+q] - b.c[q]) > b.s[q] / 2 + 1) { ok = false; break; } if (ok) idx.push(i); }
+    if (onlyOn() || A.vw.surf) V.clearLayer('pocket'); else recSticks(V, 'pocket', idx);
+    drawSurface(V);
+    if (A.vw.box) V.box('box', b); else V.clearLayer('box');
+    const p = A.pockets[A.pocketSel]; if (p && A.boxMode === 'auto') V.points('pts', p.pts); else V.clearLayer('pts');
+    if (A.example && A.ligs.some(q => q.crystal) === false && A.recName.startsWith('1IEP') && false) {}
+    drawKey(V); V.frame(b.c, Math.max(...b.s) / 2 + 6); V.slab = (A.vw.surf && !onlyOn()) ? 120 : Math.max(...b.s) / 2 + 8; V._cam();
+    info.append(h('span', { text: 'Box centre ' + b.c.map(v => v.toFixed(1)).join(', ') }), h('span', { text: b.s.map(v => v.toFixed(0)).join(' × ') + ' Å' }));
+    return;
+  }
+  if (A.step === 'res') {
+    const l = ligOf(A.pose.id), r = l && resOf(A.pose.id);
+    if (!r) { ['lig', 'pocket', 'hb', 'hy', 'pp', 'hl', 'hires', 'hilbl', 'trace', 'box', 'pts', 'ref', 'key', 'keylbl', 'surf'].forEach(n => V.clearLayer(n)); empty.hidden = false; empty.textContent = 'Run a docking to see poses here.'; return; }
+    showPose(l, r.modes[A.pose.mode] || r.modes[0]);
+  }
+}
+
+/* ===================== panels ===================== */
+function renderSteps() {
+  const nav = $('#steps'); nav.replaceChildren();
+  const done = { draw: A.ligs.length > 0, model: A.ligs.some(l => l.state === 'min'), rec: !!A.rec && !!A.box, dock: Object.keys(A.results).length > 0, res: false };
+  STEPS.forEach(([k, t], i) => nav.append(h('button', { cls: 'step' + (A.step === k ? ' on' : '') + (done[k] && A.step !== k ? ' done' : ''), type: 'button', on: { click: () => go(k) } }, h('span', { cls: 'n', text: done[k] && A.step !== k ? '✓' : String(i + 1) }), h('span', { cls: 't', text: t }))));
+}
+function go(k) { if (A.running) return toast('Docking is running. Cancel it first.'); A.step = k; refreshAll(); }
+function refreshAll() { renderSteps(); renderPanel(); refreshView(); }
+function renderPanel() {
+  const p = $('#panel'), top = p.scrollTop; p.replaceChildren(({ draw: panelDraw, model: panelModel, rec: panelRec, dock: panelDock, res: panelRes })[A.step]()); if (!p.firstChild) return; p.scrollTop = top; if (A.step === 'draw') renderLive(); renderSteps();
+}
+const stat = l => l.state === 'min' ? h('span', { cls: 'chip ok', text: 'minimised' }) : l.state === '3d' ? h('span', { cls: 'chip ok', text: '3D' }) : h('span', { cls: 'chip', text: '2D' });
+
+function libraryList(opts = {}) {
+  if (!A.ligs.length) return h('p', { cls: 'note', text: 'No ligands yet. Draw a structure, then add it to the library.' });
+  return h('div', { cls: 'list' }, A.ligs.map((l, ix) => h('div', { cls: 'item' + (l.id === A.sel ? ' on' : ''), on: { click: e => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return; A.sel = l.id; if (A.step === 'res' && A.results[l.id]) A.pose = { id: l.id, mode: 0 }; refreshAll(); } } },
+    opts.check ? h('input', { type: 'checkbox', checked: l.dockOn !== false, 'aria-label': 'Dock ' + l.name, on: { change: e => { l.dockOn = e.target.checked; } } }) : null,
+    h('span', { cls: 'lx', text: 'Ligand ' + (ix + 1) + ' -' }), h('input', { type: 'text', value: ligShort(l), 'aria-label': 'Ligand ' + (ix + 1) + ' name', on: { change: e => { l.name = e.target.value.trim() || l.name; e.target.value = ligShort(l); }, click: e => e.stopPropagation() } }),
+    h('span', { cls: 'fm', text: l.fm }), stat(l),
+    opts.del === false ? null : h('button', { cls: 'btn sm', type: 'button', text: '×', title: 'Remove', 'aria-label': 'Remove ' + l.name, on: { click: e => { e.stopPropagation(); A.ligs = A.ligs.filter(q => q !== l); delete A.results[l.id]; if (A.sel === l.id) A.sel = A.ligs[0] ? A.ligs[0].id : null; refreshAll(); } } }))));
+}
+
+function panelDraw() {
+  const box = h('div', { cls: 'sec' });
+  box.append(h('h2', { text: 'Draw a ligand' }),
+    h('p', { cls: 'lead', text: 'Use ' + cpName('molvex') + ' on the right to draw. Every connected structure on the page appears below as you draw. Add the ones you want to dock.' }));
+  box.append(h('ol', { cls: 'wf' }, ...['Draw the ligand', '3D build and minimise', 'Load a target, set the pocket', 'Dock and read the score'].map((t, i) => h('li', {}, h('b', { text: String(i + 1) }), t))),
+    h('p', { cls: 'note', text: cpName('molvex') + ' is loaded from the drawing tool in this site. Replace that file and Dock follows. Scores are Vina-style estimates for ranking and exploration, not AutoDock Vina itself.' }));
+  if (BL.err) box.append(h('p', { cls: 'bad', text: BL.err }));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'On the page now' }), h('div', { id: 'liveBox' })));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Ligand library' }), libraryList(),
+    h('div', { cls: 'row' }, h('button', { cls: 'btn', text: 'Update from drawing', title: 'Re-read the structures from the page into library entries that came from it', on: { click: updateFromDrawing } }),
+      h('button', { cls: 'btn pri', text: 'Continue to 3D', disabled: !A.ligs.length, on: { click: () => go('model') } }))));
+  box.append(h('details', {}, h('summary', { text: 'How this works' }), h('p', { cls: 'note', style: 'margin-top:8px', text: 'Molvex gives a 2D molfile. Hydrogens are added, wedge and hash bonds fix stereochemistry, and a conformer search with a generic force field builds 3D coordinates. Minimisation uses steepest descent then conjugate gradient, as in ChimeraX. Docking uses a Vina-style scoring function with a Monte Carlo and BFGS search, written for this page. It is not AutoDock Vina itself, so scores are comparable in spirit but not identical.' })));
+  return box;
+}
+function renderLive() {
+  const b = $('#liveBox'); if (!b) return; b.replaceChildren();
+  if (A.live.err) b.append(h('p', { cls: 'bad', text: A.live.err }));
+  if (!A.live.comps.length && !A.live.err) { b.append(h('p', { cls: 'note', text: 'The page is empty. Use the Examples menu in Molvex, or draw a bond.' })); return; }
+  const list = h('div', { cls: 'list' });
+  for (const c of A.live.comps) {
+    const added = A.ligs.some(l => l.di === c.i && l.sig === sigOf(c.parsed));
+    list.append(h('div', { cls: 'item', style: 'cursor:default' }, h('span', { cls: 'nm', text: c.custom ? 'Structure ' + (c.i + 1) : (c.fm || 'Structure ' + (c.i + 1)) }), h('span', { cls: 'fm', text: c.custom ? '' : c.mw.toFixed(2) + ' g/mol' }),
+      c.custom ? h('span', { cls: 'warn', text: 'has a custom label' }) : h('button', { cls: 'btn sm' + (added ? '' : ' pri'), type: 'button', text: added ? 'Added' : 'Add', disabled: added || !!c.err, on: { click: () => { const l = addFromDrawing(c); l.sig = sigOf(c.parsed); renderPanel(); } } })));
+  }
+  b.append(list);
+  if (A.live.comps.some(c => c.custom)) b.append(h('p', { cls: 'warn', style: 'margin-top:6px', text: 'Labels such as R, Ph or Boc have no 3D geometry. Draw the real atoms to use that structure.' }));
+  const ok = A.live.comps.filter(c => !c.custom && !c.err && !A.ligs.some(l => l.di === c.i && l.sig === sigOf(c.parsed)));
+  if (ok.length > 1) b.append(h('button', { cls: 'btn sm', style: 'margin-top:6px', type: 'button', text: 'Add all (' + ok.length + ')', on: { click: () => { ok.forEach(c => { const l = addFromDrawing(c); l.sig = sigOf(c.parsed); }); renderPanel(); } } }));
+}
+const sigOf = p => p.atoms.map(a => a.el + a.q + Math.round(a.x * 20) + ',' + Math.round(a.y * 20)).join('|') + '#' + p.bonds.map(b => b.a + '-' + b.b + 'o' + b.o + 's' + b.st).join('|');
+function updateFromDrawing() {
+  let n = 0; for (const l of A.ligs) { if (l.di == null) continue; const c = A.live.comps.find(q => q.i === l.di); if (!c || c.custom) continue; const s = sigOf(c.parsed); if (s === l.sig) continue;
+    l.parsed = c.parsed; l.sig = s; l.mol = null; l.state = '2d'; l.hist = []; l.E = null; l.parts = null; l.dock = null; delete A.results[l.id]; l.fm = c.fm; l.mw = c.mw; n++; }
+  toast(n ? n + ' ligand' + (n > 1 ? 's' : '') + ' updated. Convert them to 3D again.' : 'The library already matches the drawing.'); renderPanel();
+}
+
+function panelModel() {
+  const box = h('div', { cls: 'sec' }), l = sel();
+  box.append(h('h2', { text: '3D structure and minimisation' }));
+  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add a ligand in the Draw step first.' }), h('button', { cls: 'btn', text: 'Back to Draw', on: { click: () => go('draw') } })); return box; }
+  box.append(libraryList({ del: false }));
+  const o = A.o, num = (lab, key, min, max, step) => h('div', { cls: 'row' }, h('label', { text: lab }), h('input', { type: 'number', min, max, step, value: o[key], on: { change: e => { o[key] = Math.max(min, Math.min(max, +e.target.value || o[key])); e.target.value = o[key]; } } }));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: '1. Convert 2D to 3D' }), num('Conformers', 'conf', 1, 60, 1),
+    h('div', { cls: 'row' }, h('button', { cls: 'btn pri', text: 'Convert selected', disabled: !l || !!A.busy, on: { click: async () => { A.busy = 'x'; try { convert3D(l); } catch (e) { toast('3D conversion failed: ' + e.message, 6000); } A.busy = ''; refreshAll(); } } }),
+      h('button', { cls: 'btn', text: 'Convert all', disabled: !!A.busy, on: { click: async () => { A.busy = 'x'; renderPanel(); await tick(); for (const q of A.ligs) { if (q.crystal) continue; try { convert3D(q); } catch (e) { toast(q.name + ': ' + e.message, 6000); } await tick(); } A.busy = ''; refreshAll(); } } })),
+    h('p', { cls: 'note', text: 'Adds hydrogens, keeps wedge and hash stereochemistry, then ranks random conformers by force-field energy.' })));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: '2. Minimise' }), num('Steepest descent', 'sd', 0, 5000, 10), num('Conjugate gradient', 'cg', 0, 2000, 5), num('Step size (Å)', 'step', 0.001, 0.2, 0.005),
+    h('label', { cls: 'chk' }, h('input', { type: 'checkbox', checked: o.conv, on: { change: e => { o.conv = e.target.checked; } } }), 'Repeat until the energy stops changing'),
+    h('div', { cls: 'row' }, h('button', { cls: 'btn pri', text: 'Minimise selected', disabled: !l || !!A.busy, on: { click: async () => { A.busy = 'x'; renderPanel(); await tick(); try { await minimiseLig(l); } catch (e) { toast('Minimisation failed: ' + e.message, 6000); } A.busy = ''; refreshAll(); } } }),
+      h('button', { cls: 'btn', text: 'Minimise all', disabled: !!A.busy, on: { click: async () => { A.busy = 'x'; renderPanel(); await tick(); for (const q of A.ligs) { if (q.crystal) continue; try { await minimiseLig(q); } catch (e) { toast(q.name + ': ' + e.message, 6000); } } A.busy = ''; refreshAll(); } } }))));
+  if (l && l.mol) {
+    box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Energy' }), plot(l.hist, l.E),
+      h('dl', { cls: 'kv' }, ...(l.parts ? [['Bond stretch', l.parts.bond], ['Angle bend', l.parts.angle], ['Torsion', l.parts.tors], ['Planarity', l.parts.oop], ['van der Waals', l.parts.vdw], ['Total', l.E]] : [['Total', l.E]]).flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { text: f1(v) + ' kJ/mol' })])),
+      h('p', { cls: 'note', text: 'A small generic force field (bonds, angles, torsions, planarity, Lennard-Jones). Fine for docking input, not for conformational energetics.' }),
+      h('div', { cls: 'row' }, h('button', { cls: 'btn sm', text: 'Save PDB', on: { click: () => saveFile(ligLabel(l).replace(/\W+/g, '_') + '.pdb', Chem.toPDB(l.mol, 'LIG')) } }), h('button', { cls: 'btn sm', text: 'Save SDF', on: { click: () => saveFile(ligLabel(l).replace(/\W+/g, '_') + '.sdf', Chem.toSDF(l.mol, l.name)) } }))));
+  }
+  if (l) box.append(propsCard(l));
+  box.append(h('button', { cls: 'btn pri wide', text: 'Continue to target', on: { click: () => go('rec') } }));
+  return box;
+}
+function plot(hist, E) {
+  const W = 340, Hh = 92, svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('class', 'plot'); svg.setAttribute('viewBox', `0 0 ${W} ${Hh}`); svg.setAttribute('preserveAspectRatio', 'none'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', 'Energy during minimisation');
+  if (!hist || hist.length < 2) { svg.innerHTML = `<text x="10" y="50">No minimisation run yet</text>`; return svg; }
+  const mn = Math.min(...hist), mx = Math.max(...hist), rng = (mx - mn) || 1; let d = '';
+  const step = Math.max(1, Math.floor(hist.length / 300)); for (let i = 0; i < hist.length; i += step) d += (i ? 'L' : 'M') + (8 + (W - 16) * i / (hist.length - 1)).toFixed(1) + ' ' + (Hh - 14 - (Hh - 30) * (hist[i] - mn) / rng).toFixed(1);
+  svg.innerHTML = `<path d="${d}"/><text x="8" y="11">${f1(mx)}</text><text x="8" y="${Hh - 3}">${f1(mn)} kJ/mol</text>`; return svg;
+}
+
+/* Ligands shown prominently on the Target step as "Ligand X - name" */
+/* Molecules found in the structure file, named like the library ligands: "Ligand X - CODE" */
+const hetLabel = g => 'Ligand ' + ((A.hets || []).indexOf(g) + 1) + ' - ' + g.res;
+const hetSub = g => 'residue ' + g.resi + (g.chain.trim() ? ', chain ' + g.chain : '') + ' · ' + g.nHeavy + ' atoms' + (A.hetNames && A.hetNames[g.res] ? ' · ' + (A.hetNames[g.res].length > 30 ? A.hetNames[g.res].toLowerCase().slice(0, 30) + '…' : A.hetNames[g.res].toLowerCase()) : '');
+function ligandsOnTarget() {
+  const sec = h('div', { cls: 'sec ligbox' }, h('h3', { text: 'Your ligands (to dock)' }));
+  if (!A.ligs.length) { sec.append(h('p', { cls: 'note', text: 'No ligands yet. Draw one in the Draw step.' })); return sec; }
+  sec.append(h('div', { cls: 'list' }, ...A.ligs.map(l => h('div', { cls: 'item' + (l.id === A.sel ? ' on' : ''), on: { click: () => { A.sel = l.id; refreshAll(); } } }, h('span', { cls: 'ligname', text: ligLabel(l) }), h('span', { cls: 'fm', text: l.fm || '' }), l.crystal ? h('span', { cls: 'chip ok', text: 'bound pose' }) : null, stat(l)))));
+  sec.append(h('p', { cls: 'note', text: 'Rename a ligand in the Model step. The number follows the order of the library.' }));
+  return sec;
+}
+function panelRec() {
+  const box = h('div', { cls: 'sec' });
+  box.append(h('h2', { text: 'Target and binding pocket' }));
+  if (A.busy && A.busy !== 'x') box.append(h('p', { cls: 'lead', text: A.busy + '…' }));
+  const fi = h('input', { type: 'file', accept: '.pdb,.ent,.txt', 'aria-label': 'Choose a PDB file', on: { change: e => { const fl = e.target.files[0]; if (!fl) return; const rd = new FileReader(); rd.onload = () => { A.example = null; loadReceptorText(String(rd.result), fl.name); }; rd.readAsText(fl); } } });
+  const ta = h('textarea', { cls: 'paste big', placeholder: 'Paste the PDB text here (lines starting with ATOM and HETATM)', spellcheck: 'false', 'aria-label': 'PDB text' });
+  const go1 = () => { if (ta.value.trim()) { A.example = null; loadReceptorText(ta.value, 'pasted structure'); } else toast('Paste the PDB text into the box first.'); };
+  box.append(h('div', { cls: 'sec loadbox' }, h('h3', { text: A.rec ? 'Load a different protein' : 'Step 1. Paste your protein (PDB text)' }),
+    h('ol', { cls: 'how' }, h('li', { text: 'On rcsb.org open your structure, then choose Display Files > Legacy PDB.' }), h('li', { text: 'Copy the entire page of text, then paste it below and press Load.' })),
+    h('p', { cls: 'note', text: 'Waters are removed automatically. A bound ligand in the file can be used to centre the pocket.' }),
+    ta, h('button', { cls: 'btn pri wide', text: 'Load pasted PDB text', disabled: !!A.busy, on: { click: go1 } }),
+    h('div', { cls: 'row', style: 'margin-top:2px' }, h('span', { cls: 'note', text: 'Or load a saved file:' }), fi),
+    h('p', { cls: 'note', text: 'This page cannot download from the PDB itself.' })));
+  box.append(ligandsOnTarget());
+  if (!A.rec) return box;
+  const rec = A.rec;
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: A.recName }),
+    h('dl', { cls: 'kv' }, h('dt', { text: 'Heavy atoms used' }), h('dd', { text: String(rec.n) }), h('dt', { text: 'Hydrogens in file' }), h('dd', { text: rec.fileHasH ? 'yes' : 'no (donors by residue)' }), h('dt', { text: 'Waters' }), h('dd', { text: 'removed' })),
+    A.chains.length > 1 ? h('div', { cls: 'row' }, h('label', { text: 'Chains' }), ...A.chains.map(c => h('label', { cls: 'chk' }, h('input', { type: 'checkbox', checked: A.selChains.has(c), on: { change: e => { if (e.target.checked) A.selChains.add(c); else A.selChains.delete(c); if (!A.selChains.size) A.selChains.add(c); A.box = null; prepRec(); } } }), c || '-'))) : null,
+    A.hets.length ? h('div', { cls: 'sec' }, h('p', { cls: 'note', text: 'Ligands and other molecules found in the structure. Tick to keep one as part of the target, or use it to centre the box.' }), ...A.hets.map(g => h('div', { cls: 'row' }, h('label', { cls: 'chk', style: 'min-width:0;flex:1' }, h('input', { type: 'checkbox', checked: A.keepHet.has(g.id), on: { change: e => { if (e.target.checked) A.keepHet.add(g.id); else A.keepHet.delete(g.id); prepRec(); } } }), h('span', { style: 'display:flex;flex-direction:column;min-width:0' }, h('span', { cls: 'ligname', text: hetLabel(g) }), h('span', { cls: 'sub', style: 'white-space:normal;font-family:var(--ui)', text: hetSub(g) }))), g.nHeavy >= 5 ? h('button', { cls: 'btn sm', text: 'Box on this', on: { click: () => { useHet(g); refreshAll(); } } }) : null))) : null));
+  /* pocket */
+  const modes = [['auto', 'Detected pockets'], ['site', 'Known site'], ['res', 'Residues'], ['manual', 'Manual']];
+  const sec = h('div', { cls: 'sec' }, h('h3', { text: 'Binding pocket' }), h('div', { cls: 'seg' }, ...modes.map(([k, t]) => h('button', { type: 'button', cls: A.boxMode === k ? 'on' : '', text: t, on: { click: () => { A.boxMode = k; if (k === 'auto' && A.pockets.length) usePocket(Math.max(0, A.pocketSel)); if (k === 'site') { if (A.example) useExampleSite(); } refreshAll(); } } }))));
+  if (A.boxMode === 'auto') sec.append(A.pockets.length ? h('div', { cls: 'list' }, A.pockets.map((p, i) => h('div', { cls: 'item' + (i === A.pocketSel ? ' on' : ''), on: { click: () => { usePocket(i); refreshAll(); } } }, h('span', { cls: 'nm', text: 'Pocket ' + (i + 1) }), h('span', { cls: 'fm', text: Math.round(p.vol) + ' Å³' })))) : h('p', { cls: 'note', text: 'No enclosed cavities found. Use a known site, residues or the manual box.' }),
+    h('p', { cls: 'note', text: 'Found by scanning for grid points buried on both sides (LIGSITE style). Largest first.' }));
+  if (A.boxMode === 'site') { const gs = A.hets.filter(g => g.nHeavy >= 5);
+    sec.append(...[A.example ? h('div', { cls: 'row' }, h('button', { cls: 'btn', text: 'Centre on imatinib (1IEP)', on: { click: () => { useExampleSite(); refreshAll(); } } })) : null,
+      gs.length ? h('div', { cls: 'row' }, ...gs.map(g => h('button', { cls: 'btn', text: hetLabel(g), on: { click: () => { useHet(g); refreshAll(); } } }))) : (A.example ? null : h('p', { cls: 'note', text: 'The file has no ligand to centre on.' }))].filter(Boolean)); }
+  if (A.boxMode === 'res') { const inp = h('input', { type: 'text', id: 'resin', placeholder: 'A:381, A:315, 316-320', 'aria-label': 'Residues' }); sec.append(h('div', { cls: 'row' }, inp, h('button', { cls: 'btn', text: 'Set box', on: { click: () => useResidues(inp.value) } })), h('p', { cls: 'note', text: 'Residue numbers as in the file. The box is fitted around them.' })); }
+  const b = A.box; if (b) {
+    const g = (lab, arr, q, min, max) => h('label', {}, lab, h('input', { type: 'number', step: '0.5', min, max, value: +arr[q].toFixed(2), on: { change: e => { arr[q] = Math.max(min, Math.min(max, +e.target.value)); A.boxMode = 'manual'; refreshView(); renderPanel(); } } }));
+    sec.append(h('h3', { text: 'Search box (Å)', style: 'margin-top:6px' }), h('div', { cls: 'grid3' }, g('Centre x', b.c, 0, -1e4, 1e4), g('Centre y', b.c, 1, -1e4, 1e4), g('Centre z', b.c, 2, -1e4, 1e4), g('Size x', b.s, 0, 8, 60), g('Size y', b.s, 1, 8, 60), g('Size z', b.s, 2, 8, 60)));
+    const pts = b.s.reduce((a, v) => a * (Math.ceil(v / A.o.spacing) + 1), 1); if (pts > 400000) sec.append(h('p', { cls: 'warn', text: 'This box is large. Grid maps will take a while to build.' }));
+  }
+  box.append(sec);
+  box.append(keyPanel());
+  box.append(h('button', { cls: 'btn pri wide', text: 'Continue to docking', disabled: !A.box, on: { click: () => go('dock') } }));
+  return box;
+}
+
+function panelDock() { const b = panelDockMain(); b.append(vinaInfo()); return b; }
+function panelDockMain() {
+  const box = h('div', { cls: 'sec' }); box.append(h('h2', { text: 'Dock' }));
+  if (!A.rec || !A.box) { box.append(h('p', { cls: 'lead', text: 'Load a target and set the search box first.' }), h('button', { cls: 'btn', text: 'Go to target', on: { click: () => go('rec') } })); return box; }
+  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add at least one ligand.' }), h('button', { cls: 'btn', text: 'Go to Draw', on: { click: () => go('draw') } })); return box; }
+  const o = A.o, num = (lab, key, min, max, step, conv) => h('div', { cls: 'row' }, h('label', { text: lab }), h('input', { type: 'number', min, max, step, value: o[key], disabled: A.running, on: { change: e => { o[key] = Math.max(min, Math.min(max, +e.target.value || o[key])); e.target.value = o[key]; } } }));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Ligands to dock' }), libraryList({ check: true, del: false }), A.ligs.some(l => l.state === '2d') ? h('p', { cls: 'note', text: 'Ligands still in 2D are converted to 3D automatically. Minimise them first for better input geometry.' }) : null));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Search' }), num('Exhaustiveness', 'runs', 1, 256, 1), h('div', { cls: 'row' }, h('label', { text: 'Effort' }), h('select', { disabled: A.running, 'aria-label': 'Search effort', on: { change: e => { o.effort = +e.target.value; } } }, ...[[0.5, 'Quick'], [1, 'Standard'], [3, 'Thorough'], [8, 'Exhaustive']].map(([v, t]) => h('option', { value: v, text: t, selected: o.effort === v })))),
+    num('Poses to keep', 'modes', 1, 20, 1), num('Energy range (kJ/mol)', 'rangeKJ', 1, 40, 0.5), h('div', { cls: 'row' }, h('label', { text: 'Grid spacing' }), h('select', { disabled: A.running, 'aria-label': 'Grid spacing', on: { change: e => { o.spacing = +e.target.value; } } }, ...[[0.375, '0.375 Å (finer)'], [0.5, '0.5 Å'], [0.75, '0.75 Å (faster)']].map(([v, t]) => h('option', { value: v, text: t, selected: o.spacing === v })))),
+    h('p', { cls: 'note', text: 'Exhaustiveness is the number of independent Monte Carlo runs. Each run takes more steps for ligands with more rotatable bonds.' })));
+  if (A.running) {
+    box.append(h('div', { cls: 'sec' }, h('p', { id: 'pg-txt', cls: 'sub' }), h('div', { cls: 'bar', 'aria-label': 'Grid maps' }, h('i', { id: 'pg-grid' })), h('div', { cls: 'bar', 'aria-label': 'Docking' }, h('i', { id: 'pg-lig' })), h('button', { cls: 'btn wide', text: 'Cancel', on: { click: () => { A.cancel = true; } } })));
+  } else box.append(h('button', { cls: 'btn pri wide', text: 'Run docking', on: { click: runDocking } }));
+  box.append(selfCheckCard());
+  box.append(h('details', {}, h('summary', { text: 'AutoDock-GPU (runs outside the browser)' }), h('p', { cls: 'note', style: 'margin:6px 0', text: 'AutoDock-GPU needs a GPU and a native install, and it scores with AutoDock4 rather than Vina. It cannot run inside this page, so the built-in engine stays the default. The job sheet below holds your search box and the commands to run it on a machine with a GPU.' }), h('button', { cls: 'btn sm', text: 'Save AutoDock-GPU job sheet', on: { click: exportADGPU } })));
+  box.append(h('p', { cls: 'note', text: 'Progress appears in a console at the bottom of the view while something is running, then it hides itself. Pin it to keep it open.' }), h('button', { cls: 'btn sm', text: CON.pinned ? 'Unpin console' : 'Pin console open', on: { click: () => { CON.pinned = !CON.pinned; if (CON.pinned) { $('#con').classList.remove('hide'); conOpen(true); } else conTouch(); renderPanel(); } } }));
+  return box;
+}
+
+
+/* About the scoring engine: what Dock implements of AutoDock Vina, with the live weights and how it was checked. */
+function vinaInfo() {
+  const W = Dock.W, rows = [['gauss1', W.g1, 'attraction, narrow (width 0.5 Å)'], ['gauss2', W.g2, 'attraction, wide (width 2 Å, offset 3 Å)'], ['repulsion', W.rep, 'steric clash, d < 0'], ['hydrophobic', W.hyd, 'carbon/halogen contacts, ramp 0.5–1.5 Å'], ['H-bond', W.hb, 'donor–acceptor, ramp 0 to −0.7 Å'], ['rotatable bonds', W.rot, 'affinity = inter / (1 + w · N_rot)']];
+  const d = h('details', { cls: 'sec vina' }, h('summary', { text: 'About the scoring (AutoDock Vina)' }));
+  d.append(
+    h('p', { cls: 'note', style: 'margin:6px 0', text: 'Dock uses the AutoDock Vina scoring function, unchanged since Vina 1.0. The current Vina release is 1.2.7 (it added AD4 and Vinardo options, but its default scoring is the same). Distances are surface-to-surface (d = r − R_i − R_j) using Vina’s XS radii, with an 8 Å cutoff.' }),
+    h('table', { cls: 'vtab' }, h('thead', {}, h('tr', {}, h('th', { text: 'Term' }), h('th', { cls: 'num', text: 'Weight' }), h('th', { text: 'Role' }))),
+      h('tbody', {}, ...rows.map(r => h('tr', {}, h('td', { text: r[0] }), h('td', { cls: 'num', text: String(r[1]) }), h('td', { text: r[2] }))))),
+    h('p', { cls: 'note', style: 'margin:8px 0 4px', text: 'How a run works' }),
+    h('ul', { cls: 'note', style: 'margin:0 0 6px;padding-left:18px' },
+      h('li', { text: 'Grid maps (default 0.375 Å, Vina’s spacing) are built for each ligand atom type and used for the search.' }),
+      h('li', { text: 'Exhaustiveness = number of independent Monte Carlo runs, each step followed by BFGS local optimisation (default ' + A.o.runs + ').' }),
+      h('li', { text: 'Kept poses are then re-optimised and re-scored with exact pair sums, because trilinear maps under-read the sharp gauss1 term by about 7 %. Reported scores come from this step.' }),
+      h('li', { text: 'Scores are shown in kcal/mol (switch to kJ/mol in Results).' })),
+    h('p', { cls: 'note', style: 'margin:8px 0 4px', text: 'Checked against Vina 1.2.7 (1IEP, imatinib)' }),
+    h('p', { cls: 'note', style: 'margin:0 0 6px', text: 'Crystal pose −12.53 here vs −12.51 kcal/mol in Vina. Redocking gives about −13.3 vs −13.26, with the top pose within about 0.3–0.9 Å of the crystal pose.' }),
+    h('p', { cls: 'note', style: 'margin:8px 0 4px', text: 'Differences to keep in mind' }),
+    h('ul', { cls: 'note', style: 'margin:0;padding-left:18px' },
+      h('li', { text: 'Receptor and ligand preparation are Dock’s own (hydrogens, protonation, atom typing), not Meeko or MGLTools, so scores can shift by a kcal/mol or so on other targets.' }),
+      h('li', { text: 'Rigid receptor only; waters and non-selected hetero groups are removed; no metal or covalent handling.' }),
+      h('li', { text: 'Too few runs can miss the best pose. Raise exhaustiveness if the top score changes between runs.' }),
+      h('li', { text: 'A score is an estimate: it ranks poses well and ligands only roughly.' })));
+  return d;
+}
+
+/* ---------- interaction list for the selected pose ---------- */
+const IXNAME = { hbond: ['H-bond', 'ix-hb'], pipi: ['π–π stacking', 'ix-pp'], hydrophobic: ['Hydrophobic', 'ix-hy'] }, IXORDER = { hbond: 0, pipi: 1, hydrophobic: 2 };
+function pickResidue(k) {
+  A.hiRes = A.hiRes === k ? null : k; const l = ligOf(A.pose.id), rr = l && resOf(A.pose.id), m = rr && (rr.modes[A.pose.mode] || rr.modes[0]);
+  renderPanel(); if (l && m) showPose(l, m, true);
+}
+function interactionsCard(m) {
+  const keys = nativeKeys(), list = m.inter.list || [], sec = h('div', { cls: 'sec' }, h('h3', { text: 'Interactions · pose ' + m.rank }));
+  const nb = list.filter(x => x.type === 'hbond').length, np = list.filter(x => x.type === 'pipi').length, nh = list.filter(x => x.type === 'hydrophobic').length;
+  sec.append(h('div', { cls: 'row', style: 'gap:6px' }, h('span', { cls: 'chip ix-hb', text: nb + ' H-bond' + (nb === 1 ? '' : 's') }), h('span', { cls: 'chip ix-pp', text: np + ' π–π' }), h('span', { cls: 'chip ix-hy', text: nh + ' hydrophobic residue' + (nh === 1 ? '' : 's') }),
+    h('button', { cls: 'btn sm', type: 'button', style: 'margin-left:auto', text: A.vw.inter ? 'Hide lines' : 'Show lines', on: { click: () => { A.vw.inter = !A.vw.inter; refreshAll(); } } })));
+  if (!list.length) { sec.append(h('p', { cls: 'note', text: 'No H-bond, hydrophobic or π–π interactions were found for this pose.' })); return sec; }
+  const g = new Map(); for (const x of list) { const k = keyId(x.chain, x.resi); if (!g.has(k)) g.set(k, { chain: x.chain, resi: x.resi, res: x.res, items: [] }); g.get(k).items.push(x); }
+  const rows = [...g.entries()].sort((a, b) => (keys.has(b[0]) - keys.has(a[0])) || (a[1].chain < b[1].chain ? -1 : a[1].chain > b[1].chain ? 1 : a[1].resi - b[1].resi));
+  const tb = h('tbody', {});
+  for (const [k, r] of rows) {
+    const isKey = keys.has(k), nm = r.res + r.resi + (A.chains.length > 1 ? ':' + r.chain : '');
+    r.items.sort((a, b) => IXORDER[a.type] - IXORDER[b.type] || a.d - b.d);
+    r.items.forEach((x, i) => {
+      const atoms = x.type === 'pipi' ? 'ring ↔ ring, ' + x.angle.toFixed(0) + '° tilt' : x.lig + ' ↔ ' + x.rec + (x.n > 1 ? '  (+' + (x.n - 1) + ' more)' : '');
+      tb.append(h('tr', { cls: (i === 0 ? 'ix-first' : '') + ' ixrow' + (A.hiRes === k ? ' hi' : ''), title: 'Click to highlight ' + nm + ' in the 3D view', on: { click: () => pickResidue(k) } }, h('td', {}, i === 0 ? h('span', { cls: isKey ? 'keyres' : '', text: nm, title: isKey ? 'Key residue: next to the natural ligand' : '' }) : null),
+        h('td', {}, h('span', { cls: 'chip ' + IXNAME[x.type][1], text: IXNAME[x.type][0] })), h('td', { cls: 'sub', style: 'white-space:normal', text: atoms }), h('td', { cls: 'num', text: x.d.toFixed(2) })));
+    });
+  }
+  sec.append(h('table', { cls: 'ix' }, h('thead', {}, h('tr', {}, h('th', { text: 'Residue' }), h('th', { text: 'Interaction' }), h('th', { text: 'Atoms' }), h('th', { cls: 'num', text: 'Å' }))), tb));
+  sec.append(h('p', { cls: 'note', html: keys.size ? '<span class="keyres">Bold underlined</span> residues are key residues, next to where the natural ligand binds (within ' + A.keyDist + ' Å; change this under Key residues below).' : 'No natural ligand is known for this target, so no key residues are marked. Add some under Key residues below.' }));
+  sec.append(h('p', { cls: 'note', text: 'Click a residue to highlight it in the 3D view (click again to clear). H-bond: donor to acceptor ≤ ' + 3.5 + ' Å. Hydrophobic: carbon or halogen contact ≤ ' + Dock.HYD_CUT + ' Å (nearest pair per residue). π–π stacking: ring centroids ≤ ' + Dock.PIPI_CUT + ' Å with planes within ' + Dock.PIPI_ANGLE + '° of parallel. Distances in Å.' }));
+  return sec;
+}
+
+/* ---------- self-check: redock the structure's own (natural) ligand and measure RMSD against its crystal pose ---------- */
+const HILITE = 0x00ff40; /* bright lime green for the highlighted residue and its interaction lines */
+const RMSD_LIMIT = 2.2, SC_MAX = 10;
+const nativeLig = () => A.ligs.find(l => l.crystal && l.ref) || null;
+/* Candidates: ligands (HETATM groups) found in the structure, largest first, then any bound ligand loaded as SDF. */
+function scCandidates() {
+  const out = [];
+  for (const g of [...(A.hets || [])].filter(g => g.nHeavy >= 5 && g.nHeavy <= 150).sort((p, q) => q.nHeavy - p.nHeavy)) out.push({ id: 'het:' + g.id, kind: 'het', g, label: hetLabel(g), sub: hetSub(g) });
+  for (const l of A.ligs) if (l.crystal && l.ref) out.push({ id: 'lig:' + l.id, kind: 'lig', l, label: ligLabel(l), sub: 'loaded as SDF' });
+  if (!out.length && A.example) out.push({ id: 'ex', kind: 'ex', label: 'Imatinib (example crystal pose)', sub: 'example' });
+  return out;
+}
+function buildCheckLig(c) {
+  if (c.kind === 'ex') { const l = addExampleLigand(); return { id: 'selfcheck', name: l.name, label: ligLabel(l), mol: l.mol, ref: l.ref, state: '3d', crystal: true }; }
+  if (c.kind === 'lig') return { id: 'selfcheck', name: c.l.name, label: ligLabel(c.l), mol: c.l.mol, ref: c.l.ref, state: '3d', crystal: true };
+  if (A.keepHet.has(c.g.id)) throw new Error(c.label + ' is kept as part of the target, so redocking it would clash with itself. Untick it in the Target step first.');
+  const p = Chem.fromHet(c.g.atoms), mol = Chem.prepare(p); mol.T = Chem.buildTopology(mol);
+  const f = Chem.formula(mol);
+  return { id: 'selfcheck', name: c.g.res, label: c.label, mol, ref: mol.atoms.map(a => [a.x, a.y, a.z]), state: '3d', crystal: true, fm: f.text, note: p.note };
+}
+function addNativeFromSDF(text, fname) {
+  let parsed, mol; try { parsed = Chem.parseMol(text); mol = Chem.prepare(parsed); mol.T = Chem.buildTopology(mol); } catch (e) { toast('Could not read that ligand: ' + e.message); return null; }
+  const heavy = mol.atoms.filter(a => a.el !== 'H').map(a => [a.x, a.y, a.z]), nm = (fname || 'bound ligand').replace(/\.[^.]+$/, '');
+  const l = addLigand(parsed, nm + ' (bound pose)', { mol, state: '3d', E: Chem.energy(Chem.coords(mol), mol.T), crystal: true, ref: mol.atoms.map(a => [a.x, a.y, a.z]) });
+  const f = Chem.formula(mol); l.fm = f.text; l.mw = f.mass; A.natives.push({ id: l.id, name: nm, heavy }); A.sel = l.id; A.check = null; return l;
+}
+async function selfCheck(opt = {}) {
+  if (A.running) { toast('Something is already running.'); return 'busy'; }
+  if (!A.rec) { toast('Load a target first.'); return 'no'; }
+  const cands = scCandidates();
+  if (!cands.length) { toast('No ligand was found in this structure. Paste a PDB file that contains the bound ligand (HETATM lines).', 6000); return 'no'; }
+  const c = cands.find(x => x.id === (opt.id || A.scSel)) || cands[0]; A.scSel = c.id;
+  let l; try { l = buildCheckLig(c); } catch (e) { toast('Self-check: ' + e.message, 7000); return 'no'; }
+  const hv = l.mol.atoms.filter(a => a.el !== 'H').map(a => [a.x, a.y, a.z]), cen = [0, 1, 2].map(q => hv.reduce((s, p) => s + p[q], 0) / hv.length);
+  const inside = A.box && cen.every((v, q) => Math.abs(v - A.box.c[q]) <= A.box.s[q] / 2 - 1);
+  const box = inside ? A.box : Dock.boxFromPoints(hv, 12, 20);
+  A.running = true; A.cancel = false; A.progress = { grid: 0, lig: 0, name: 'Self-check', i: 0, n: 1 }; renderPanel(); refreshView();
+  const prog = () => { const p = A.progress; const g = $('#pg-grid'), r = $('#pg-lig'), t = $('#pg-txt'); if (g) g.style.width = (p.grid * 100) + '%'; if (r) r.style.width = (p.lig * 100) + '%'; if (t) t.textContent = p.name; };
+  conOpen(true); clog('--- Self-check: extracting ' + l.label + ' from the structure and redocking it into its own site. Pass if the best pose is within ' + RMSD_LIMIT + ' Å ---');
+  if (c.kind === 'het') clog('  ' + l.label + ': ' + hv.length + ' heavy atoms, ' + (l.fm || '') + (l.note ? ' (' + l.note + ')' : ''));
+  if (!inside) clog('  Your search box does not cover this ligand, so a temporary box around it is used. Your box is unchanged.');
+  let status = 'fail';
+  try {
+    const d = ligForDock(l), keys = [...new Set(d.types.filter(Boolean))], t0 = performance.now();
+    const G = await Dock.buildGrids(A.rec, box, keys, { spacing: A.o.spacing }, p => { A.progress.grid = p; prog(); conProgress(p); }, () => A.cancel);
+    const attempts = [], results = []; let pass = false;
+    for (let k = 0; k < SC_MAX && !pass; k++) {
+      const runs = Math.min(256, A.o.runs * (k < 3 ? 1 << k : 8)), effort = A.o.effort * (k ? 1.5 : 1), seed = 101 + k * 37, t1 = performance.now();
+      A.progress.name = 'Self-check, attempt ' + (k + 1) + ' of ' + SC_MAX; A.progress.lig = 0; prog(); clog('Attempt ' + (k + 1) + ': ' + runs + ' runs, effort ' + effort + ', seed ' + seed);
+      const res = await Dock.dockLigand(d, G, { runs, effort, modes: A.o.modes, range: A.o.rangeKJ / 4.184, seed }, { progress: f => { A.progress.lig = f; prog(); conProgress(f); }, cancelled: () => A.cancel });
+      const rm = res.modes.map(m => Dock.symRmsd(d, m.pos, l.ref)), bst = Math.min(...rm);
+      const at = { n: k + 1, runs, effort, seed, top: rm[0], best: bst, bestRank: rm.indexOf(bst) + 1, kcal: res.modes[0].kcal, time: (performance.now() - t1) / 1000, poses: res.modes.length };
+      attempts.push(at); results.push(res); pass = at.top <= RMSD_LIMIT;
+      clog('  best pose RMSD ' + at.top.toFixed(2) + ' Å, lowest of ' + at.poses + ' poses ' + at.best.toFixed(2) + ' Å (pose ' + at.bestRank + '), score ' + at.kcal.toFixed(2) + ' kcal/mol, ' + at.time.toFixed(0) + ' s', pass ? 'ok' : 'err');
+      if (!pass && k < SC_MAX - 1) clog('  RMSD is above ' + RMSD_LIMIT + ' Å, so the search is rerun with a new seed (up to ' + SC_MAX + ' attempts).');
+    }
+    const fi = pass ? attempts.length - 1 : attempts.reduce((a, b, i) => (b.top < attempts[a].top ? i : a), 0), fin = attempts[fi], res = results[fi];
+    l.dock = d; const best = res.modes[0]; best.rank = 1; best.inter = Dock.interactions(d, A.rec, best.pos); best.rmsdRef = fin.top;
+    A.check = { id: 'selfcheck', lig: l, label: l.label, res: { modes: [best], nrot: res.nrot, runs: res.runs }, limit: RMSD_LIMIT, attempts, pass, fin, time: (performance.now() - t0) / 1000, symmetry: Dock.automorphisms(d).length };
+    A.pose = { id: 'selfcheck', mode: 0 };
+    try { if (ensureViewer()) { showPose(l, best, true); best.img = A.viewer.snapshot(336, 252); } } catch (e) { console.error(e); }
+    status = pass ? 'pass' : 'fail';
+    clog('--- Self-check ' + (pass ? 'PASSED' : 'FAILED') + ': RMSD ' + fin.top.toFixed(2) + ' Å after ' + attempts.length + ' attempt' + (attempts.length > 1 ? 's' : '') + ' ---', pass ? 'ok' : 'err');
+    if (!pass) toast('Self-check failed: the best redocked RMSD was ' + fin.top.toFixed(2) + ' Å after ' + attempts.length + ' attempts. Check the target preparation, protonation and the box.', 8000);
+  } catch (e) { conProgress(-1); if (e.message === 'cancelled') { status = 'cancelled'; toast('Self-check cancelled.'); } else { console.error(e); toast('Self-check failed: ' + e.message, 7000); } }
+  A.running = false; conProgress(-1); conTouch(); refreshAll(); return status;
+}
+function viewSelfCheck() { A.pose = { id: 'selfcheck', mode: 0 }; go('res'); }
+/* One line at the top of the results: DOCKING SELF CHECK: RMSD = XX Angstroms */
+function selfCheckBanner() {
+  const c = A.check;
+  if (!c) return h('div', { cls: 'scb none' }, h('span', { cls: 'scb-t', text: 'DOCKING SELF CHECK: not run' }), h('button', { cls: 'btn sm', type: 'button', text: 'Run it', disabled: A.running || !scCandidates().length, on: { click: async () => { await selfCheck(); renderPanel(); } } }));
+  return h('div', { cls: 'scb ' + (c.pass ? 'pass' : 'fail') }, h('div', { cls: 'scb-t', text: 'DOCKING SELF CHECK: RMSD = ' + c.fin.top.toFixed(2) + ' Angstroms' }),
+    h('div', { cls: 'sub', style: 'white-space:normal', text: (c.pass ? 'PASS' : 'FAIL') + ' (limit ' + c.limit + ' Å) · ' + c.label + ' taken from the structure and redocked · ' + c.attempts.length + ' attempt' + (c.attempts.length > 1 ? 's' : '') }));
+}
+/* The best pose only, shown like any other docking result, at the top of the results. Click to view it in 3D with the crystal pose in grey. */
+function selfCheckPoseCard() {
+  const c = A.check, m = c.res.modes[0], on = A.pose.id === 'selfcheck';
+  return h('div', { cls: 'sec' }, h('h3', { text: 'Self-check · ' + c.label }),
+    h('div', { cls: 'modes' }, h('div', { cls: 'mode' + (on ? ' on' : ''), title: 'Click to view this pose in 3D', on: { click: () => { A.pose = { id: 'selfcheck', mode: 0 }; refreshAll(); } } },
+      m.img ? h('img', { src: m.img, alt: 'Best redocked pose of ' + c.label }) : h('div'),
+      h('div', {}, h('div', { cls: 'aff' }, uTxt(m), h('small', { text: uName() })), h('div', { cls: 'sub', text: 'Best pose · ' + uAlt(m) }),
+        h('div', { cls: 'sub', text: 'RMSD to crystal ' + m.rmsdRef.toFixed(2) + ' Å · lowest of ' + c.fin.poses + ' poses ' + c.fin.best.toFixed(2) + ' Å' }),
+        h('div', { cls: 'sub', text: m.inter.hbonds.length + ' H-bonds · ' + m.inter.hydRes + ' hydrophobic · ' + m.inter.pipi + ' π–π' })))),
+    on ? h('p', { cls: 'note', text: 'In the 3D view the redocked pose is coloured and the crystal pose is thin grey.' }) : h('p', { cls: 'note', text: 'Select it to see it in 3D next to the crystal pose.' }));
+}
+function selfCheckCard() {
+  const sec = h('div', { cls: 'sec' }, h('h3', { text: 'Model self-check' })), cands = scCandidates(), can = cands.length > 0, cur = cands.find(x => x.id === A.scSel) || cands[0];
+  sec.append(h('p', { cls: 'note', text: 'Takes the ligand that was bound in the PDB structure, redocks it into its own site and measures how far the best pose lands from the crystal pose (heavy atoms, symmetry-aware). If it is above ' + RMSD_LIMIT + ' Å the search is rerun with a different seed, up to ' + SC_MAX + ' attempts. The seed that gave the best result is then used for your docking. Only the best pose is kept and shown at the top of the results.' }));
+  if (!can) sec.append(h('p', { cls: 'note', text: 'No ligand was found in the pasted structure. Paste a PDB file that includes the bound ligand (HETATM lines), or load it as an SDF below.' }));
+  else if (cands.length > 1) sec.append(h('div', { cls: 'row' }, h('label', { text: 'Ligand' }), h('select', { disabled: A.running, 'aria-label': 'Ligand for the self-check', on: { change: e => { A.scSel = e.target.value; } } }, ...cands.map(x => h('option', { value: x.id, selected: cur && x.id === cur.id, text: x.label })))));
+  else sec.append(h('p', { cls: 'sub', style: 'white-space:normal', text: 'Ligand: ' + cur.label + (cur.sub ? ' · ' + cur.sub : '') }));
+  const inp = h('input', { type: 'file', accept: '.sdf,.mol', hidden: true, 'aria-label': 'Choose the bound ligand as SDF', on: { change: async e => { const f = e.target.files[0]; if (!f) return; const l = addNativeFromSDF(await f.text(), f.name); e.target.value = ''; if (l) { A.scSel = 'lig:' + l.id; clog('Loaded the bound ligand ' + ligLabel(l) + '.'); refreshAll(); } } } });
+  sec.append(h('div', { cls: 'row' }, h('button', { cls: 'btn' + (A.check ? '' : ' pri'), type: 'button', text: A.check ? 'Rerun self-check' : 'Run self-check', disabled: A.running || !can, on: { click: () => selfCheck() } }),
+    A.check && A.check.res ? h('button', { cls: 'btn', type: 'button', text: 'View result', disabled: A.running, on: { click: viewSelfCheck } }) : null,
+    h('button', { cls: 'btn', type: 'button', text: 'Load bound ligand (SDF)', disabled: A.running, on: { click: () => inp.click() } }), inp));
+  sec.append(h('label', { cls: 'chk' }, h('input', { type: 'checkbox', checked: !!A.o.selfFirst, disabled: A.running, on: { change: e => { A.o.selfFirst = e.target.checked; } } }), h('span', { text: 'Run the self-check before every docking' })));
+  const c = A.check; if (!c) return sec;
+  sec.append(h('div', { cls: 'chk-res' }, h('div', { cls: 'row', style: 'gap:8px' }, h('span', { cls: 'chip ' + (c.pass ? 'ok' : 'no'), text: c.pass ? 'PASS' : 'FAIL' }), h('span', { cls: 'aff', text: c.fin.top.toFixed(2), }), h('span', { cls: 'sub', text: 'Å RMSD, best pose · limit ' + c.limit + ' Å' })),
+    h('p', { cls: 'sub', style: 'white-space:normal;margin-top:4px', text: c.label + ' redocked. Lowest of ' + c.fin.poses + ' poses: ' + c.fin.best.toFixed(2) + ' Å (pose ' + c.fin.bestRank + '). ' + c.attempts.length + ' attempt' + (c.attempts.length > 1 ? 's' : '') + ', ' + c.time.toFixed(0) + ' s' + (c.symmetry > 1 ? ', ' + c.symmetry + ' symmetry-equivalent atom mappings checked' : '') + '.' }),
+    c.attempts.length > 1 ? h('table', { cls: 'vtab', style: 'margin-top:6px' }, h('thead', {}, h('tr', {}, h('th', { text: 'Attempt' }), h('th', { cls: 'num', text: 'Runs' }), h('th', { cls: 'num', text: 'Best pose' }), h('th', { cls: 'num', text: 'Lowest' }))),
+      h('tbody', {}, ...c.attempts.map(a => h('tr', {}, h('td', { text: String(a.n) }), h('td', { cls: 'num', text: String(a.runs) }), h('td', { cls: 'num', text: a.top.toFixed(2) + ' Å' }), h('td', { cls: 'num', text: a.best.toFixed(2) + ' Å' }))))) : null,
+    c.pass ? null : h('p', { cls: 'warn', style: 'margin-top:6px', text: 'Even the larger searches stayed above the limit. Typical causes: wrong protonation or missing waters or cofactors in the target, a box that is too small, or a ligand that is not the one in this structure.' })));
+  return sec;
+}
+function panelRes() {
+  const box = h('div', { cls: 'sec' }); box.append(h('h2', { text: 'Docking results' }));
+  box.append(selfCheckBanner());
+  const chk = A.check && A.check.res ? A.check : null; if (chk) box.append(selfCheckPoseCard());
+  box.append(h('div', { cls: 'unit', role: 'group', 'aria-label': 'Energy unit' }, ...['kcal', 'kJ'].map(u => h('button', { cls: 'btn sm' + (UNIT === u ? ' on' : ''), 'aria-pressed': String(UNIT === u), text: u + '/mol', on: { click: () => { UNIT = u; try { localStorage.setItem('cp-dock-unit', u); } catch (e) {} renderPanel(); refreshAll(); } } }))));
+  const done = A.ligs.filter(l => A.results[l.id]);
+  if (!done.length && !chk) { box.append(h('p', { cls: 'lead', text: 'No results yet.' }), h('button', { cls: 'btn', text: 'Go to Dock', on: { click: () => go('dock') } })); return box; }
+  const onChk = !!(chk && (A.pose.id === 'selfcheck' || !done.length));
+  let l, m;
+  if (done.length) {
+    const hasRef = done.some(q => q.ref);
+    box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Your docked compounds' }), h('table', {}, h('thead', {}, h('tr', {}, h('th', { text: 'Ligand' }), h('th', { cls: 'num', text: uName() }), h('th', { cls: 'num', text: UNIT === 'kJ' ? 'kcal/mol' : 'kJ/mol' }), h('th', { cls: 'num', text: 'H-bonds' }), hasRef ? h('th', { cls: 'num', text: 'RMSD ref' }) : null)),
+      h('tbody', {}, ...done.map(q => { const b = A.results[q.id].modes[0]; return h('tr', { cls: 'sel' + (!onChk && q.id === A.pose.id ? ' pick' : ''), title: 'Click to view this compound', on: { click: () => { A.sel = q.id; A.pose = { id: q.id, mode: 0 }; refreshAll(); } } }, h('td', { text: ligLabel(q) }), h('td', { cls: 'num', text: uTxt(b) }), h('td', { cls: 'num', text: UNIT === 'kJ' ? b.kcal.toFixed(2) : f1(b.kJ) }), h('td', { cls: 'num', text: String(b.inter.hbonds.length) }), hasRef ? h('td', { cls: 'num', text: b.rmsdRef != null ? b.rmsdRef.toFixed(2) + ' Å' : '' }) : null); })))));
+  }
+  if (onChk) { l = chk.lig; m = chk.res.modes[0]; }
+  else {
+    l = A.ligs.find(q => q.id === A.pose.id && A.results[q.id]) || done[0]; const r = A.results[l.id];
+    box.append(h('div', { cls: 'sec' }, h('h3', { text: ligLabel(l) + ' · ' + r.modes.length + ' poses' }), h('div', { cls: 'modes' }, ...r.modes.map((q, k) => h('div', { cls: 'mode' + (k === A.pose.mode && A.pose.id === l.id ? ' on' : ''), on: { click: () => { A.pose = { id: l.id, mode: k }; renderPanel(); showPose(l, q); } } },
+      q.img ? h('img', { src: q.img, alt: 'Pose ' + q.rank + ' in the binding pocket' }) : h('div'),
+      h('div', {}, h('div', { cls: 'aff' }, uTxt(q), h('small', { text: uName() })), h('div', { cls: 'sub', text: 'Pose ' + q.rank + ' · ' + uAlt(q) }),
+        h('div', { cls: 'sub', text: q.inter.hbonds.length + ' H-bonds · ' + q.inter.hydRes + ' hydrophobic · ' + q.inter.pipi + ' π–π' + (q.rmsdRef != null ? ' · RMSD to crystal ' + q.rmsdRef.toFixed(2) + ' Å' : '') })))))));
+    m = r.modes[A.pose.id === l.id ? A.pose.mode : 0] || r.modes[0];
+  }
+  if (m) box.append(interactionsCard(m));
+  if (m && m.inter.contacts.length) box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Residues within 4.2 Å' }), h('p', { cls: 'sub', style: 'white-space:normal', text: m.inter.contacts.map(c => c.res + c.resi).join('  ') })));
+  if (!onChk) box.append(propsCard(l));
+  box.append(keyPanel());
+  const nm = ligLabel(l).replace(/\W+/g, '_');
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Export' }), h('div', { cls: 'row' },
+    h('button', { cls: 'btn sm', text: 'Table (CSV)', on: { click: exportCSV } }), h('button', { cls: 'btn sm', text: 'Pose (SDF)', on: { click: () => saveFile(nm + '_pose' + m.rank + '.sdf', Chem.toSDF(poseMol(l, m), l.name + ' pose ' + m.rank)) } }),
+    h('button', { cls: 'btn sm', text: 'Complex (PDB)', on: { click: () => saveFile(nm + '_complex' + m.rank + '.pdb', complexPDB(l, m)) } }),
+    h('button', { cls: 'btn sm', text: 'Pose image', on: { click: async () => { showPose(l, m); saveFile(nm + '_pose' + m.rank + '.png', await dataUrlBlob(A.viewer.snapshot(1600, snapH(1600)))); } } })),
+    h('p', { cls: 'note', text: 'Affinity is the Vina-style score of the pose, scaled for rotatable bonds, shown in kcal/mol by default (switch to kJ/mol above; (1 kcal = 4.184 kJ). It ranks poses well and ligands only roughly. Treat it as an estimate.' })));
+  return box;
+}
+const poseMol = (l, m) => ({ atoms: l.dock.mol.atoms.map((a, i) => ({ ...a, x: m.pos[3*i], y: m.pos[3*i+1], z: m.pos[3*i+2] })), bonds: l.dock.mol.bonds });
+function complexPDB(l, m) {
+  let s = '', k = 1; const rec = A.rec;
+  for (let i = 0; i < rec.n; i++) { const a = rec.meta[i], nm = a.name.length < 4 && a.el.length === 1 ? ' ' + a.name.padEnd(3) : a.name.padEnd(4).slice(0, 4);
+    s += (a.het ? 'HETATM' : 'ATOM  ') + String(k++).padStart(5) + ' ' + nm + ' ' + a.res.padEnd(3) + ' ' + (a.chain || ' ') + String(a.resi).padStart(4) + '    ' + rec.X[3*i].toFixed(3).padStart(8) + rec.X[3*i+1].toFixed(3).padStart(8) + rec.X[3*i+2].toFixed(3).padStart(8) + '  1.00  0.00          ' + a.el.toUpperCase().padStart(2) + '\n'; }
+  return s + 'TER\n' + Chem.toPDB(poseMol(l, m), 'LIG', 'L', 1).replace(/^HETATM(.{5})/gm, (q, n) => 'HETATM' + String(+n + k).padStart(5)).replace(/^CONECT.*\n/gm, '');
+}
+function exportCSV() {
+  const rows = [['ligand', 'pose', 'affinity_kJ_per_mol', 'affinity_kcal_per_mol', 'hbonds', 'hydrophobic_contacts', 'rmsd_to_reference_A', 'MW', 'MLOGP', 'TPSA', 'HBD', 'HBA', 'rotatable_bonds', 'ESOL_logS', 'lipinski_violations']];
+  for (const l of A.ligs) { const r = A.results[l.id]; if (!r) continue; r.modes.forEach(m => rows.push([ligLabel(l), m.rank, m.kJ.toFixed(2), m.kcal.toFixed(3), m.inter.hbonds.length, m.inter.hydrophobic, m.rmsdRef != null ? m.rmsdRef.toFixed(2) : '', ...(() => { const P = ligProps(l); return P && !P.error ? [P.mw.toFixed(2), P.logp.toFixed(2), P.tpsa.toFixed(1), P.hbd, P.hba, P.rb, P.logs.toFixed(2), P.lipinski.violations] : ['', '', '', '', '', '', '', '']; })()])); }
+  saveFile('docking_results.csv', rows.map(r => r.map(v => /[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : v).join(',')).join('\n'));
+}
+
+/* ===================== boot ===================== */
+$('#b-theme').onclick = () => { const r = document.documentElement, nx = dark() ? 'light' : 'dark'; r.dataset.theme = nx; try { localStorage.setItem('cp-theme', nx); } catch (e) {} syncBLTheme(); if (A.viewer) A.viewer.dark = dark(); refreshView(); };
+try { const t = localStorage.getItem('cp-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+window.addEventListener('resize', () => { if (A.viewer) A.viewer.resize(); });
+$('#con-h').onclick = e => { if (e.target.closest('button')) return; conOpen(!CON.open); };
+$('#con-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); conOpen(!CON.open); } };
+$('#con-clear').onclick = () => { CON.lines.length = 0; $('#con-log').textContent = ''; $('#con-last').textContent = 'Cleared.'; };
+$('#con-copy').onclick = async () => { const s = CON.lines.map(x => x.ts + '  ' + x.msg).join('\n'); try { await navigator.clipboard.writeText(s); toast('Console copied.'); } catch (e) { toast('Could not copy. Select the text instead.'); } };
+clog(cpName('rapiddock') + ' ready. Draw a ligand, then paste a PDB structure in the Target step.');
+loadMolvex(); refreshAll();
+window.__bd = { scCandidates, selfCheck, nativeKeys, ligLabel, addNativeFromSDF, A, Chem, Dock, loadExample, addExampleLigand, clog, ligProps, convert3D, minimiseLig, runDocking, addFromDrawing, poll, go };
+})();

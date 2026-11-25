@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title data-brand="platform" data-brand-suffix=" Changelog">Molvex Changelog</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<script src="../shared/theme.js"></script>
+<script src="../shared/brand.js"></script>
+<script src="../shared/versions.js"></script>
+<meta name="color-scheme" content="dark light">
+<style>
+:root{
+  --bg:#1A1918; --panel:#232220; --paper:#2B2926; --line:#3A3835; --fg:#ECE8E1; --muted:#9A958B;
+  --accent:#D97757; --accent-soft:rgba(217,119,87,.16); --accent-fg:#1F0E07; color-scheme:dark;
+  --ui:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif; --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+:root[data-theme="light"]{
+  --bg:#F0EEE6; --panel:#FAF9F5; --paper:#FFFFFF; --line:#DDD9CC; --fg:#1F1E1D; --muted:#6B665C;
+  --accent:#C15F3C; --accent-soft:rgba(193,95,60,.12); --accent-fg:#FFFFFF; color-scheme:light;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--ui);padding-inline:max(16px,env(safe-area-inset-left,0px)) max(16px,env(safe-area-inset-right,0px))}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wrap{max-width:860px;margin:0 auto;padding-block:20px 56px}
+header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+header .sp{flex:1}
+.btn{height:30px;padding:0 12px;display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--paper);border-radius:6px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-decoration:none}
+.btn:hover{border-color:var(--accent)}
+h1{margin:40px 0 8px;font-size:clamp(26px,4.5vw,36px);line-height:1.15;letter-spacing:-.02em;font-weight:600}
+.lead{margin:0 0 22px;color:var(--muted);max-width:62ch}
+.filters{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 26px}
+.filters button{height:28px;padding:0 11px;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:14px;font:500 12.5px var(--ui);cursor:pointer}
+.filters button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+section.tool{margin:0 0 36px}
+section.tool>h2{display:flex;align-items:baseline;gap:10px;margin:0 0 4px;font-size:20px;font-weight:600}
+.cur{font:500 11.5px var(--mono);color:var(--accent);border:1px solid var(--accent);border-radius:10px;padding:2px 8px}
+.about{margin:0 0 14px;color:var(--muted);font-size:14px}
+.rel{border-left:2px solid var(--line);padding:0 0 14px 16px;margin-left:4px;position:relative}
+.rel::before{content:"";position:absolute;left:-6px;top:6px;width:10px;height:10px;border-radius:50%;background:var(--bg);border:2px solid var(--accent)}
+.rel h3{margin:0 0 4px;font-size:14.5px;font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.rel h3 time{font:12px var(--mono);color:var(--muted);font-weight:400}
+.rel ul{margin:0;padding-left:18px;color:var(--fg)}
+.rel li{margin:2px 0;font-size:14px}
+.rel li::marker{color:var(--muted)}
+.note{color:var(--muted);font-size:13px;border:1px dashed var(--line);border-radius:8px;padding:10px 12px;margin:0 0 24px}
+footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="btn" href="../" id="home">&larr; Home</a>
+    <span class="sp"></span>
+    <button class="btn" id="theme" type="button">Light mode</button>
+  </header>
+  <h1>Changelog</h1>
+  <p class="lead">What each tool does and has gained so far.</p>
+  <div class="filters" id="filters" role="group" aria-label="Show"></div>
+  <div id="log"></div>
+</div>
+<script>
+/* Newest release first inside each tool. rel = [heading, date, [items]] */
+const LOG = [
+  { id: "site", name: "Home page", about: "Landing page for the Molvex tools.", rel: [
+    ["0.3.5", "2026-11-25", ["All tool versions moved to 0.3.5."]],
+    ["0.3.4", "2026-11-25", ["All tool versions moved to 0.3.4."]],
+    ["0.3.3", "2026-11-25", ["All tool versions moved to 0.3.3.","Naming is now set in one file, shared/brand.js. Molvex is the platform name, and the tools are shown as Molvex Draw and Molvex RapidDock. Renaming the platform later means changing one word there."]],
+    ["0.3", "2026-11-24", ["All tool versions moved to 0.3."]],
+    ["0.2b", "2026-11-24", ["All tool versions moved to 0.2b."]],
+    ["0.2a", "2026-11-24", ["Molvex home page with a card for each tool and its version.","Shared dark/light theme that is remembered.","Changelog page, linked from the footer and from every version chip.","Split from the 3D printing tools, which now live in their own repository."]]] },
+  { id: "molvex", name: cpName("molvex"), about: "2D chemical structure editor. Formerly Bondline.", rel: [
+    ["0.3.5", "2026-11-25", ["Version number only."]],
+    ["0.3.4", "2026-11-25", ["Version number only."]],
+    ["0.3.3", "2026-11-25", ["Shown as Molvex Draw (name comes from shared/brand.js). No other changes."]],
+    ["0.3", "2026-11-24", ["Ring rotation now snaps every 15°, both when dragging the round handle and when placing a ring by hold and drag. Hold Alt for fine steps."]],
+    ["0.2b", "2026-11-24", ["Clear all button erases everything on the page, after a confirmation. Undo brings it back.","Rotate rings: click inside any ring to select it (with its simple substituents) and drag the round handle to turn it about its attachment atom; hold Shift for 15° steps.","Place and rotate in one move: with a ring tool, press where the ring should go, hold and drag to turn it (the ring follows the drag direction; around the atom for a spiro ring), release to place. Shift gives 15° steps.","Shift + C / B / S / E sets the hovered atom (or the atom tool) to Cl / Br / Si / Se."]],
+    ["0.2a", "2026-11-24", ["Draw rings, chains, charges and stereochemistry; export a molfile.","SMILES: copy the SMILES of any drawn structure (SMILES button and Structure panel), or paste SMILES, one per line, to draw it. Aromatic rings are drawn as Kekulé structures; stereo marks are not read or written.","3D view: builds the structure in 3D with hydrogens and a force-field geometry, ball-and-stick or sticks, rotate and zoom, click an atom for its geometry (tetrahedral, trigonal planar, bent...) with measured bond lengths and angles; save as SDF or PNG.","Offline IUPAC naming, no network needed: chains, rings, benzene with substituents, esters, amides with N-substituents, retained names, lowest-locant numbering, alphabetised prefixes and nested brackets. Fused and heterocyclic ring systems are not named offline yet.","Shared theme (dark by default), Home button and version chip.","Exposes molfile() so Molvex RapidDock can read the drawing.","Renamed from Bondline."]]] },
+  { id: "rapiddock", name: cpName("rapiddock"), about: "Draw, build in 3D, minimise, define a pocket and dock with Vina scoring. Formerly Bondline Dock and RapidDock.", rel: [
+    ["0.3.5", "2026-11-25", ["Version number only."]],
+    ["0.3.4", "2026-11-25", ["Self check now retries with different seeds, up to 10 attempts, until the best pose is within 2.2 Å. The best seed is then used for your docking run.","Results page: the self-check pose no longer traps the view. Your docked compounds stay listed above it, so you can click back to them at any time.","Highlighted residue and its interaction lines are now bright lime green."]],
+    ["0.3.3", "2026-11-25", ["Shown as Molvex RapidDock (name comes from shared/brand.js).","Docking self check now takes the natural ligand straight from the pasted PDB (its HETATM group, with bond orders worked out from the geometry), redocks it and keeps only the best pose. That pose is shown at the top of the results like any other docking result, with its RMSD to the crystal pose. Select it to see it in 3D with the crystal pose drawn in thin grey. If the structure holds several ligands, pick which one on the Dock page."]],
+    ["0.3", "2026-11-24", ["Target step: pasting PDB text is now the main option, with a short instruction (Display Files > Legacy PDB, copy the entire page, paste). The example protein was removed.","Ligands are listed prominently on the Target step as \"Ligand X - name\". This includes the molecules found in the structure file (for example Ligand 1 - STI), their Box on this buttons, and the key-residue picker. The console log uses the same labels.","Docking results start with a line \"DOCKING SELF CHECK: RMSD = XX Angstroms\" (with PASS or FAIL), or a button to run it.","Removed \"RMSD from best\" from the pose list and the CSV. The RMSD to the crystal pose is still shown where a crystal pose exists.","Interaction list: click a residue to highlight it in the 3D view (residue sticks, label and its interaction lines), click again to clear.","Interaction lines are thicker, and light mode uses darker, higher-contrast colours (blue, green, purple)."]],
+    ["0.2b", "2026-11-24", ["Model self-check: redocks the bound ligand into its own site and reports the RMSD to the crystal pose (heavy atoms, symmetry-aware). If the top pose is above 2.2 Å the search reruns with more runs and a new seed, up to 3 attempts. Optional: run it before every docking. Load the bound ligand as an SDF for your own targets.","Ligand selector reads \"Ligand X - name\" with X a running number.","Interaction list for the selected pose: H-bonds, hydrophobic contacts and π–π stacking (ring centroids ≤ 3.8 Å, planes within 30°) per residue, with atoms and distances in Å. Key residues (next to the natural ligand) are bold and underlined. Coloured lines in the 3D view: H-bonds blue, hydrophobic green, π–π purple.","RMSD to the crystal pose now accounts for symmetric groups such as flipped phenyl rings."]],
+    ["0.2a", "2026-11-24", ["Draw in Molvex, build 3D, minimise, load a PDB target (1IEP example), detect or set a pocket, dock; pose images, H-bonds, contacts and CSV export.","Protein surface view with smooth atom colouring, clipping plane and flat cap on cut faces.","AutoDock Vina scoring (Vina 1.2.7 terms and weights), grid search at 0.375 Å, then exact re-optimisation and scoring of kept poses. Imatinib in 1IEP: crystal pose −12.53 vs −12.51 kcal/mol in Vina; redock −13.3 vs −13.26.","Scores in kcal/mol (default) or kJ/mol, switchable and remembered.","Drug-likeness panel: Lipinski rule of five, Veber, Egan, TPSA, MLOGP, ESOL solubility and a SwissADME-style radar (estimates).","Console showing progress, hidden when idle and pinnable.","AutoDock-GPU job sheet export for running outside the browser.","About the scoring (AutoDock Vina) section on the Dock page.","PDB and SDF saves keep their real file names on the site.","Renamed to Molvex RapidDock."]]] }
+];
+const $ = s => document.querySelector(s), esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let show = 'all';
+function render() {
+  $('#log').innerHTML = LOG.filter(t => show === 'all' || t.id === show).map(t => {
+    const v = (window.CP_VERSIONS || {})[t.id];
+    return '<section class="tool"><h2>' + esc(t.name) + (v ? '<span class="cur">' + esc(window.cpVer ? window.cpVer(v) : v) + '</span>' : '') + '</h2><p class="about">' + esc(t.about) + '</p>' +
+      t.rel.map(r => '<div class="rel"><h3>' + esc(r[0]) + '<time>' + esc(r[1]) + '</time></h3><ul>' + r[2].map(i => '<li>' + esc(i) + '</li>').join('') + '</ul></div>').join('') + '</section>';
+  }).join('');
+}
+$('#filters').innerHTML = [['all', 'All']].concat(LOG.map(t => [t.id, t.name])).map(f => '<button type="button" data-f="' + f[0] + '" aria-pressed="' + (f[0] === show) + '">' + esc(f[1]) + '</button>').join('');
+$('#filters').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; show = b.dataset.f; document.querySelectorAll('#filters button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); render(); });
+render();
+if (!window.CPTheme) { const R = document.documentElement; R.dataset.theme = 'dark'; window.CPTheme = { get: () => R.dataset.theme, toggle() { R.dataset.theme = R.dataset.theme === 'dark' ? 'light' : 'dark'; window.dispatchEvent(new Event('cp-theme')); } }; }
+const tb = $('#theme'), sync = () => { const d = window.CPTheme.get() === 'dark'; tb.textContent = d ? 'Light mode' : 'Dark mode'; };
+tb.addEventListener('click', () => window.CPTheme.toggle()); window.addEventListener('cp-theme', sync); sync();
+</script>
+</body>
+</html>

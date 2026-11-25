@@ -1,0 +1,11 @@
+{
+  "name": "molvex",
+  "private": true,
+  "license": "MIT",
+  "author": "Caleb Kam",
+  "description": "Browser-based chemistry tools: Molvex and Molvex RapidDock.",
+  "scripts": {
+    "test": "node rapiddock/test/chem.test.js && node rapiddock/test/dock.test.js && node rapiddock/test/vina.test.js && node rapiddock/test/ix.test.js && node molvex/test/smilesin.test.js && node molvex/test/iupac.test.js",
+    "serve": "python3 -m http.server 8000"
+  }
+}
