@@ -47,9 +47,9 @@ const A = {
   o: { selfFirst: false, runs: 32, effort: 1, modes: 9, rangeKJ: 12.6, spacing: 0.375, sd: 100, cg: 10, step: 0.02, conf: 10, conv: true }
 };
 const sel = () => A.ligs.find(l => l.id === A.sel) || null;
-/* Ligand selector text: "Ligand X - name", X = position in the library. The stored name stays editable and is shown without any "Ligand N" prefix. */
-const ligShort = l => (l.name || '').replace(/^Ligand\s*\d+\s*[-\u2013:]?\s*/i, '').trim() || l.fm || 'unnamed';
-const ligLabel = l => l.label || ('Ligand ' + (A.ligs.indexOf(l) + 1) + ' - ' + ligShort(l));
+/* Ligand selector text: "Compound X - name", X = position in the library. The stored name stays editable and is shown without any "Compound N" prefix. */
+const ligShort = l => (l.name || '').replace(/^(?:Ligand|Compound)\s*\d+\s*[-\u2013:]?\s*/i, '').trim() || l.fm || 'unnamed';
+const ligLabel = l => l.label || ('Compound ' + (A.ligs.indexOf(l) + 1) + ' - ' + ligShort(l));
 const ligOf = id => id === 'selfcheck' ? (A.check && A.check.lig) : A.ligs.find(q => q.id === id), resOf = id => id === 'selfcheck' ? (A.check && A.check.res) : A.results[id];
 const dark = () => { const t = document.documentElement.dataset.theme; return t ? t === 'dark' : matchMedia('(prefers-color-scheme:dark)').matches; };
 const accentHex = () => dark() ? 0xd97757 : 0xc15f3c;
@@ -104,7 +104,7 @@ setInterval(poll, 700);
 
 /* ===================== ligand library ===================== */
 function addLigand(parsed, name, extra) {
-  const id = A.nextId++, l = Object.assign({ id, name: name || 'Ligand ' + id, parsed, mol: null, state: '2d', E: null, hist: [], parts: null, fm: '', mw: 0 }, extra || {});
+  const id = A.nextId++, l = Object.assign({ id, name: name || 'Compound ' + id, parsed, mol: null, state: '2d', E: null, hist: [], parts: null, fm: '', mw: 0 }, extra || {});
   try { const f = Chem.formula(l.mol || Chem.prepare(parsed)); l.fm = f.text; l.mw = f.mass; } catch (e) {}
   A.ligs.push(l); if (A.sel == null) A.sel = id; clog('Added ' + ligLabel(l) + (l.fm ? ' (' + l.fm + ', ' + l.mw.toFixed(2) + ' g/mol)' : '')); return l;
 }
@@ -134,7 +134,7 @@ function exportADGPU() {
   const names = A.ligs.map(l => ligLabel(l).replace(/\W+/g, '_'));
   const txt = [
     '# AutoDock-GPU job sheet from ' + cpName('rapiddock'),
-    '# Target: ' + (A.recName || 'target') + '   Ligands: ' + (names.join(', ') || 'none'),
+    '# Target: ' + (A.recName || 'target') + '   Compounds: ' + (names.join(', ') || 'none'),
     '#',
     '# AutoDock-GPU (https://github.com/forlilab/AutoDock-GPU) needs an OpenCL or CUDA GPU and uses AutoDock4 scoring,',
     '# so its energies are not the same scale as the Vina-style scores in this page. Do not compare the two directly.',
@@ -144,7 +144,7 @@ function exportADGPU() {
     'size    ' + b.s.map(v => v.toFixed(2)).join('  '),
     'npts    ' + np.join('  ') + '   # grid points at 0.375 A spacing, rounded up to even numbers',
     '#',
-    '# 2. Prepare files (not done here). Save the target and ligands from ' + cpName('rapiddock') + ' (PDB and SDF buttons), then make PDBQT files',
+    '# 2. Prepare files (not done here). Save the target and compounds from ' + cpName('rapiddock') + ' (PDB and SDF buttons), then make PDBQT files',
     '#    with Meeko (https://meeko.readthedocs.io), which also assigns the charges and AutoDock atom types AutoGrid needs.',
     '#',
     '# 3. Grid parameter file (target.gpf): the lines that depend on this session. Meeko or AutoDockTools writes the rest',
@@ -159,7 +159,7 @@ function exportADGPU() {
     'autogrid4 -p target.gpf -l target.glg',
     'adgpu --ffile target.maps.fld --lfile ligand.pdbqt --nrun 20',
     '#    adgpu is the name used in the Meeko tutorial; the build may be called autodock_gpu_64wi (see the AutoDock-GPU README).',
-    '#    For many ligands: adgpu --ffile target.maps.fld --filelist ligands.txt',
+    '#    For many compounds: adgpu --ffile target.maps.fld --filelist ligands.txt',
     ''
   ].join('\n');
   saveFile('autodock_gpu_job.txt', new Blob([txt], { type: 'text/plain' }));
@@ -258,11 +258,11 @@ function addExampleLigand() {
 /* ===================== docking ===================== */
 function ligForDock(l) { if (!l.mol) convert3D(l); return Dock.prepareLigand(l.mol); }
 async function runDocking() {
-  const todo = A.ligs.filter(l => l.dockOn !== false); if (!todo.length) return toast('Add and tick at least one ligand.');
+  const todo = A.ligs.filter(l => l.dockOn !== false); if (!todo.length) return toast('Add and tick at least one compound.');
   if (!A.rec) return toast('Load a target first.'); if (!A.box) return toast('Define the search box first.');
   if (A.o.selfFirst && scCandidates().length) { const sc = await selfCheck(); if (sc === 'cancelled' || sc === 'busy') return; if (sc === 'fail') clog('Self-check did not reach ' + RMSD_LIMIT + ' Å. Docking continues, but read the scores with care.', 'err'); }
   A.running = true; A.cancel = false; A.log = []; A.progress = { grid: 0, lig: 0, name: '', i: 0, n: todo.length }; renderPanel(); refreshView();
-  const log = m => clog(m); conOpen(true); clog('--- Docking run started: ' + todo.length + ' ligand' + (todo.length > 1 ? 's' : '') + ', exhaustiveness ' + A.o.runs + ', effort ' + A.o.effort + ' ---');
+  const log = m => clog(m); conOpen(true); clog('--- Docking run started: ' + todo.length + ' compound' + (todo.length > 1 ? 's' : '') + ', exhaustiveness ' + A.o.runs + ', effort ' + A.o.effort + ' ---');
   const prog = () => { const p = A.progress; const g = $('#pg-grid'), r = $('#pg-lig'), t = $('#pg-txt'); if (g) g.style.width = (p.grid * 100) + '%'; if (r) r.style.width = (p.lig * 100) + '%'; if (t) t.textContent = p.name ? p.name + ' (' + (p.i + 1) + ' of ' + p.n + ')' : ''; };
   try {
     const ligs = [];
@@ -284,7 +284,7 @@ async function runDocking() {
       A.pose = { id: l.id, mode: 0 }; conProgress(-1); log('  rendering ' + res.modes.length + ' pose images...');
       for (let m = 0; m < res.modes.length; m++) { showPose(l, res.modes[m], true); res.modes[m].img = A.viewer.snapshot(336, 252); await tick(); }
     }
-    A.running = false; conProgress(-1); clog('--- Docking finished: ' + ligs.length + ' ligand' + (ligs.length > 1 ? 's' : '') + ' ---', 'ok'); A.step = 'res'; const first = ligs[0] && ligs[0].l; if (first) { A.sel = first.id; A.pose = { id: first.id, mode: 0 }; }
+    A.running = false; conProgress(-1); clog('--- Docking finished: ' + ligs.length + ' compound' + (ligs.length > 1 ? 's' : '') + ' ---', 'ok'); A.step = 'res'; const first = ligs[0] && ligs[0].l; if (first) { A.sel = first.id; A.pose = { id: first.id, mode: 0 }; }
     refreshAll();
   } catch (e) { A.running = false; conProgress(-1); conTouch(); if (e.message === 'cancelled') { toast('Docking cancelled.'); } else { console.error(e); toast('Docking failed: ' + e.message, 7000); } refreshAll(); }
 }
@@ -486,23 +486,23 @@ function renderPanel() {
 const stat = l => l.state === 'min' ? h('span', { cls: 'chip ok', text: 'minimised' }) : l.state === '3d' ? h('span', { cls: 'chip ok', text: '3D' }) : h('span', { cls: 'chip', text: '2D' });
 
 function libraryList(opts = {}) {
-  if (!A.ligs.length) return h('p', { cls: 'note', text: 'No ligands yet. Draw a structure, then add it to the library.' });
+  if (!A.ligs.length) return h('p', { cls: 'note', text: 'No compounds yet. Draw a structure, then add it to the library.' });
   return h('div', { cls: 'list' }, A.ligs.map((l, ix) => h('div', { cls: 'item' + (l.id === A.sel ? ' on' : ''), on: { click: e => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return; A.sel = l.id; if (A.step === 'res' && A.results[l.id]) A.pose = { id: l.id, mode: 0 }; refreshAll(); } } },
     opts.check ? h('input', { type: 'checkbox', checked: l.dockOn !== false, 'aria-label': 'Dock ' + l.name, on: { change: e => { l.dockOn = e.target.checked; } } }) : null,
-    h('span', { cls: 'lx', text: 'Ligand ' + (ix + 1) + ' -' }), h('input', { type: 'text', value: ligShort(l), 'aria-label': 'Ligand ' + (ix + 1) + ' name', on: { change: e => { l.name = e.target.value.trim() || l.name; e.target.value = ligShort(l); }, click: e => e.stopPropagation() } }),
+    h('span', { cls: 'lx', text: 'Compound ' + (ix + 1) + ' -' }), h('input', { type: 'text', value: ligShort(l), 'aria-label': 'Compound ' + (ix + 1) + ' name', on: { change: e => { l.name = e.target.value.trim() || l.name; e.target.value = ligShort(l); }, click: e => e.stopPropagation() } }),
     h('span', { cls: 'fm', text: l.fm }), stat(l),
     opts.del === false ? null : h('button', { cls: 'btn sm', type: 'button', text: '×', title: 'Remove', 'aria-label': 'Remove ' + l.name, on: { click: e => { e.stopPropagation(); A.ligs = A.ligs.filter(q => q !== l); delete A.results[l.id]; if (A.sel === l.id) A.sel = A.ligs[0] ? A.ligs[0].id : null; refreshAll(); } } }))));
 }
 
 function panelDraw() {
   const box = h('div', { cls: 'sec' });
-  box.append(h('h2', { text: 'Draw a ligand' }),
+  box.append(h('h2', { text: 'Draw a compound' }),
     h('p', { cls: 'lead', text: 'Use ' + cpName('molvex') + ' on the right to draw. Every connected structure on the page appears below as you draw. Add the ones you want to dock.' }));
-  box.append(h('ol', { cls: 'wf' }, ...['Draw the ligand', '3D build and minimise', 'Load a target, set the pocket', 'Dock and read the score'].map((t, i) => h('li', {}, h('b', { text: String(i + 1) }), t))),
+  box.append(h('ol', { cls: 'wf' }, ...['Draw the compound', '3D build and minimise', 'Load a target, set the pocket', 'Dock and read the score'].map((t, i) => h('li', {}, h('b', { text: String(i + 1) }), t))),
     h('p', { cls: 'note', text: cpName('molvex') + ' is loaded from the drawing tool in this site. Replace that file and Dock follows. Scores are Vina-style estimates for ranking and exploration, not AutoDock Vina itself.' }));
   if (BL.err) box.append(h('p', { cls: 'bad', text: BL.err }));
   box.append(h('div', { cls: 'sec' }, h('h3', { text: 'On the page now' }), h('div', { id: 'liveBox' })));
-  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Ligand library' }), libraryList(),
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Compound library' }), libraryList(),
     h('div', { cls: 'row' }, h('button', { cls: 'btn', text: 'Update from drawing', title: 'Re-read the structures from the page into library entries that came from it', on: { click: updateFromDrawing } }),
       h('button', { cls: 'btn pri', text: 'Continue to 3D', disabled: !A.ligs.length, on: { click: () => go('model') } }))));
   box.append(h('details', {}, h('summary', { text: 'How this works' }), h('p', { cls: 'note', style: 'margin-top:8px', text: 'Molvex gives a 2D molfile. Hydrogens are added, wedge and hash bonds fix stereochemistry, and a conformer search with a generic force field builds 3D coordinates. Minimisation uses steepest descent then conjugate gradient, as in ChimeraX. Docking uses a Vina-style scoring function with a Monte Carlo and BFGS search, written for this page. It is not AutoDock Vina itself, so scores are comparable in spirit but not identical.' })));
@@ -527,13 +527,13 @@ const sigOf = p => p.atoms.map(a => a.el + a.q + Math.round(a.x * 20) + ',' + Ma
 function updateFromDrawing() {
   let n = 0; for (const l of A.ligs) { if (l.di == null) continue; const c = A.live.comps.find(q => q.i === l.di); if (!c || c.custom) continue; const s = sigOf(c.parsed); if (s === l.sig) continue;
     l.parsed = c.parsed; l.sig = s; l.mol = null; l.state = '2d'; l.hist = []; l.E = null; l.parts = null; l.dock = null; delete A.results[l.id]; l.fm = c.fm; l.mw = c.mw; n++; }
-  toast(n ? n + ' ligand' + (n > 1 ? 's' : '') + ' updated. Convert them to 3D again.' : 'The library already matches the drawing.'); renderPanel();
+  toast(n ? n + ' compound' + (n > 1 ? 's' : '') + ' updated. Convert them to 3D again.' : 'The library already matches the drawing.'); renderPanel();
 }
 
 function panelModel() {
   const box = h('div', { cls: 'sec' }), l = sel();
   box.append(h('h2', { text: '3D structure and minimisation' }));
-  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add a ligand in the Draw step first.' }), h('button', { cls: 'btn', text: 'Back to Draw', on: { click: () => go('draw') } })); return box; }
+  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add a compound in the Draw step first.' }), h('button', { cls: 'btn', text: 'Back to Draw', on: { click: () => go('draw') } })); return box; }
   box.append(libraryList({ del: false }));
   const o = A.o, num = (lab, key, min, max, step) => h('div', { cls: 'row' }, h('label', { text: lab }), h('input', { type: 'number', min, max, step, value: o[key], on: { change: e => { o[key] = Math.max(min, Math.min(max, +e.target.value || o[key])); e.target.value = o[key]; } } }));
   box.append(h('div', { cls: 'sec' }, h('h3', { text: '1. Convert 2D to 3D' }), num('Conformers', 'conf', 1, 60, 1),
@@ -567,10 +567,10 @@ function plot(hist, E) {
 const hetLabel = g => 'Ligand ' + ((A.hets || []).indexOf(g) + 1) + ' - ' + g.res;
 const hetSub = g => 'residue ' + g.resi + (g.chain.trim() ? ', chain ' + g.chain : '') + ' · ' + g.nHeavy + ' atoms' + (A.hetNames && A.hetNames[g.res] ? ' · ' + (A.hetNames[g.res].length > 30 ? A.hetNames[g.res].toLowerCase().slice(0, 30) + '…' : A.hetNames[g.res].toLowerCase()) : '');
 function ligandsOnTarget() {
-  const sec = h('div', { cls: 'sec ligbox' }, h('h3', { text: 'Your ligands (to dock)' }));
-  if (!A.ligs.length) { sec.append(h('p', { cls: 'note', text: 'No ligands yet. Draw one in the Draw step.' })); return sec; }
+  const sec = h('div', { cls: 'sec ligbox' }, h('h3', { text: 'Your compounds' }));
+  if (!A.ligs.length) { sec.append(h('p', { cls: 'note', text: 'No compounds yet. Draw one in the Draw step.' })); return sec; }
   sec.append(h('div', { cls: 'list' }, ...A.ligs.map(l => h('div', { cls: 'item' + (l.id === A.sel ? ' on' : ''), on: { click: () => { A.sel = l.id; refreshAll(); } } }, h('span', { cls: 'ligname', text: ligLabel(l) }), h('span', { cls: 'fm', text: l.fm || '' }), l.crystal ? h('span', { cls: 'chip ok', text: 'bound pose' }) : null, stat(l)))));
-  sec.append(h('p', { cls: 'note', text: 'Rename a ligand in the Model step. The number follows the order of the library.' }));
+  sec.append(h('p', { cls: 'note', text: 'Rename a compound in the Model step. The number follows the order of the library.' }));
   return sec;
 }
 function panelRec() {
@@ -617,12 +617,12 @@ function panelDock() { const b = panelDockMain(); b.append(vinaInfo()); return b
 function panelDockMain() {
   const box = h('div', { cls: 'sec' }); box.append(h('h2', { text: 'Dock' }));
   if (!A.rec || !A.box) { box.append(h('p', { cls: 'lead', text: 'Load a target and set the search box first.' }), h('button', { cls: 'btn', text: 'Go to target', on: { click: () => go('rec') } })); return box; }
-  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add at least one ligand.' }), h('button', { cls: 'btn', text: 'Go to Draw', on: { click: () => go('draw') } })); return box; }
+  if (!A.ligs.length) { box.append(h('p', { cls: 'lead', text: 'Add at least one compound.' }), h('button', { cls: 'btn', text: 'Go to Draw', on: { click: () => go('draw') } })); return box; }
   const o = A.o, num = (lab, key, min, max, step, conv) => h('div', { cls: 'row' }, h('label', { text: lab }), h('input', { type: 'number', min, max, step, value: o[key], disabled: A.running, on: { change: e => { o[key] = Math.max(min, Math.min(max, +e.target.value || o[key])); e.target.value = o[key]; } } }));
-  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Ligands to dock' }), libraryList({ check: true, del: false }), A.ligs.some(l => l.state === '2d') ? h('p', { cls: 'note', text: 'Ligands still in 2D are converted to 3D automatically. Minimise them first for better input geometry.' }) : null));
+  box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Compounds to dock' }), libraryList({ check: true, del: false }), A.ligs.some(l => l.state === '2d') ? h('p', { cls: 'note', text: 'Compounds still in 2D are converted to 3D automatically. Minimise them first for better input geometry.' }) : null));
   box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Search' }), num('Exhaustiveness', 'runs', 1, 256, 1), h('div', { cls: 'row' }, h('label', { text: 'Effort' }), h('select', { disabled: A.running, 'aria-label': 'Search effort', on: { change: e => { o.effort = +e.target.value; } } }, ...[[0.5, 'Quick'], [1, 'Standard'], [3, 'Thorough'], [8, 'Exhaustive']].map(([v, t]) => h('option', { value: v, text: t, selected: o.effort === v })))),
     num('Poses to keep', 'modes', 1, 20, 1), num('Energy range (kJ/mol)', 'rangeKJ', 1, 40, 0.5), h('div', { cls: 'row' }, h('label', { text: 'Grid spacing' }), h('select', { disabled: A.running, 'aria-label': 'Grid spacing', on: { change: e => { o.spacing = +e.target.value; } } }, ...[[0.375, '0.375 Å (finer)'], [0.5, '0.5 Å'], [0.75, '0.75 Å (faster)']].map(([v, t]) => h('option', { value: v, text: t, selected: o.spacing === v })))),
-    h('p', { cls: 'note', text: 'Exhaustiveness is the number of independent Monte Carlo runs. Each run takes more steps for ligands with more rotatable bonds.' })));
+    h('p', { cls: 'note', text: 'Exhaustiveness is the number of independent Monte Carlo runs. Each run takes more steps for compounds with more rotatable bonds.' })));
   if (A.running) {
     box.append(h('div', { cls: 'sec' }, h('p', { id: 'pg-txt', cls: 'sub' }), h('div', { cls: 'bar', 'aria-label': 'Grid maps' }, h('i', { id: 'pg-grid' })), h('div', { cls: 'bar', 'aria-label': 'Docking' }, h('i', { id: 'pg-lig' })), h('button', { cls: 'btn wide', text: 'Cancel', on: { click: () => { A.cancel = true; } } })));
   } else box.append(h('button', { cls: 'btn pri wide', text: 'Run docking', on: { click: runDocking } }));
@@ -643,7 +643,7 @@ function vinaInfo() {
       h('tbody', {}, ...rows.map(r => h('tr', {}, h('td', { text: r[0] }), h('td', { cls: 'num', text: String(r[1]) }), h('td', { text: r[2] }))))),
     h('p', { cls: 'note', style: 'margin:8px 0 4px', text: 'How a run works' }),
     h('ul', { cls: 'note', style: 'margin:0 0 6px;padding-left:18px' },
-      h('li', { text: 'Grid maps (default 0.375 Å, Vina’s spacing) are built for each ligand atom type and used for the search.' }),
+      h('li', { text: 'Grid maps (default 0.375 Å, Vina’s spacing) are built for each compound atom type and used for the search.' }),
       h('li', { text: 'Exhaustiveness = number of independent Monte Carlo runs, each step followed by BFGS local optimisation (default ' + A.o.runs + ').' }),
       h('li', { text: 'Kept poses are then re-optimised and re-scored with exact pair sums, because trilinear maps under-read the sharp gauss1 term by about 7 %. Reported scores come from this step.' }),
       h('li', { text: 'Scores are shown in kcal/mol (switch to kJ/mol in Results).' })),
@@ -651,10 +651,10 @@ function vinaInfo() {
     h('p', { cls: 'note', style: 'margin:0 0 6px', text: 'Crystal pose −12.53 here vs −12.51 kcal/mol in Vina. Redocking gives about −13.3 vs −13.26, with the top pose within about 0.3–0.9 Å of the crystal pose.' }),
     h('p', { cls: 'note', style: 'margin:8px 0 4px', text: 'Differences to keep in mind' }),
     h('ul', { cls: 'note', style: 'margin:0;padding-left:18px' },
-      h('li', { text: 'Receptor and ligand preparation are Dock’s own (hydrogens, protonation, atom typing), not Meeko or MGLTools, so scores can shift by a kcal/mol or so on other targets.' }),
+      h('li', { text: 'Receptor and compound preparation are Dock’s own (hydrogens, protonation, atom typing), not Meeko or MGLTools, so scores can shift by a kcal/mol or so on other targets.' }),
       h('li', { text: 'Rigid receptor only; waters and non-selected hetero groups are removed; no metal or covalent handling.' }),
       h('li', { text: 'Too few runs can miss the best pose. Raise exhaustiveness if the top score changes between runs.' }),
-      h('li', { text: 'A score is an estimate: it ranks poses well and ligands only roughly.' })));
+      h('li', { text: 'A score is an estimate: it ranks poses well and compounds only roughly.' })));
   return d;
 }
 
@@ -804,7 +804,7 @@ function panelRes() {
   let l, m;
   if (done.length) {
     const hasRef = done.some(q => q.ref);
-    box.append(h('div', { cls: 'sec' }, h('h3', { text: 'Your docked compounds' }), h('table', {}, h('thead', {}, h('tr', {}, h('th', { text: 'Ligand' }), h('th', { cls: 'num', text: uName() }), h('th', { cls: 'num', text: UNIT === 'kJ' ? 'kcal/mol' : 'kJ/mol' }), h('th', { cls: 'num', text: 'H-bonds' }), hasRef ? h('th', { cls: 'num', text: 'RMSD ref' }) : null)),
+    box.append(h('div', { cls: 'sec' }, h('h3', { cls: 'h2like', text: 'Your docked compounds' }), h('table', { cls: 'cmptab' }, h('thead', {}, h('tr', {}, h('th', { text: 'Compound' }), h('th', { cls: 'num', text: uName() }), h('th', { cls: 'num', text: UNIT === 'kJ' ? 'kcal/mol' : 'kJ/mol' }), h('th', { cls: 'num', text: 'H-bonds' }), hasRef ? h('th', { cls: 'num', text: 'RMSD ref' }) : null)),
       h('tbody', {}, ...done.map(q => { const b = A.results[q.id].modes[0]; return h('tr', { cls: 'sel' + (!onChk && q.id === A.pose.id ? ' pick' : ''), title: 'Click to view this compound', on: { click: () => { A.sel = q.id; A.pose = { id: q.id, mode: 0 }; refreshAll(); } } }, h('td', { text: ligLabel(q) }), h('td', { cls: 'num', text: uTxt(b) }), h('td', { cls: 'num', text: UNIT === 'kJ' ? b.kcal.toFixed(2) : f1(b.kJ) }), h('td', { cls: 'num', text: String(b.inter.hbonds.length) }), hasRef ? h('td', { cls: 'num', text: b.rmsdRef != null ? b.rmsdRef.toFixed(2) + ' Å' : '' }) : null); })))));
   }
   if (onChk) { l = chk.lig; m = chk.res.modes[0]; }
@@ -825,7 +825,7 @@ function panelRes() {
     h('button', { cls: 'btn sm', text: 'Table (CSV)', on: { click: exportCSV } }), h('button', { cls: 'btn sm', text: 'Pose (SDF)', on: { click: () => saveFile(nm + '_pose' + m.rank + '.sdf', Chem.toSDF(poseMol(l, m), l.name + ' pose ' + m.rank)) } }),
     h('button', { cls: 'btn sm', text: 'Complex (PDB)', on: { click: () => saveFile(nm + '_complex' + m.rank + '.pdb', complexPDB(l, m)) } }),
     h('button', { cls: 'btn sm', text: 'Pose image', on: { click: async () => { showPose(l, m); saveFile(nm + '_pose' + m.rank + '.png', await dataUrlBlob(A.viewer.snapshot(1600, snapH(1600)))); } } })),
-    h('p', { cls: 'note', text: 'Affinity is the Vina-style score of the pose, scaled for rotatable bonds, shown in kcal/mol by default (switch to kJ/mol above; (1 kcal = 4.184 kJ). It ranks poses well and ligands only roughly. Treat it as an estimate.' })));
+    h('p', { cls: 'note', text: 'Affinity is the Vina-style score of the pose, scaled for rotatable bonds, shown in kcal/mol by default (switch to kJ/mol above; (1 kcal = 4.184 kJ). It ranks poses well and compounds only roughly. Treat it as an estimate.' })));
   return box;
 }
 const poseMol = (l, m) => ({ atoms: l.dock.mol.atoms.map((a, i) => ({ ...a, x: m.pos[3*i], y: m.pos[3*i+1], z: m.pos[3*i+2] })), bonds: l.dock.mol.bonds });
@@ -849,7 +849,7 @@ $('#con-h').onclick = e => { if (e.target.closest('button')) return; conOpen(!CO
 $('#con-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); conOpen(!CON.open); } };
 $('#con-clear').onclick = () => { CON.lines.length = 0; $('#con-log').textContent = ''; $('#con-last').textContent = 'Cleared.'; };
 $('#con-copy').onclick = async () => { const s = CON.lines.map(x => x.ts + '  ' + x.msg).join('\n'); try { await navigator.clipboard.writeText(s); toast('Console copied.'); } catch (e) { toast('Could not copy. Select the text instead.'); } };
-clog(cpName('rapiddock') + ' ready. Draw a ligand, then paste a PDB structure in the Target step.');
+clog(cpName('rapiddock') + ' ready. Draw a compound, then paste a PDB structure in the Target step.');
 loadMolvex(); refreshAll();
 window.__bd = { scCandidates, selfCheck, nativeKeys, ligLabel, addNativeFromSDF, A, Chem, Dock, loadExample, addExampleLigand, clog, ligProps, convert3D, minimiseLig, runDocking, addFromDrawing, poll, go };
 })();
