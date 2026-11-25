@@ -1625,7 +1625,7 @@ function importSmiles(text,replace){
     const ids=r.atoms.map((a,i)=>addAtom(ox+pos[i][0],oy+pos[i][1],a.el,{q:a.q||0}));
     r.bonds.forEach(bd=>addBond(ids[bd.a].id,ids[bd.b].id,bd.o,'p'));
     r.atoms.forEach((a,i)=>{if(a.h!=null&&implH(ids[i])!==a.h)hmis=true});
-    sel=new Set(ids.map(a=>a.id));if(ids.length>1)cleanUp(true);
+    sel=new Set(ids.map(a=>a.id));if(ids.length>1){LAYOUT_FRESH=true;try{cleanUp(true)}finally{LAYOUT_FRESH=false}}
     const bb=bounds(sel);const dx=ox-bb.x0,dy=oy-(bb.y0+bb.y1)/2;for(const a of ids){a.x+=dx;a.y+=dy}
     ox=bb.x1+dx+3*L;all.push(...ids.map(a=>a.id))}
   sel=new Set(all);touch();commit();fitView();
@@ -1891,15 +1891,16 @@ function relax(ids,rings){
       let dx=c.x-a.x,dy=c.y-a.y,d=hyp(dx,dy);if(d>=L*0.78)continue;if(d<1e-3){dx=rnd();dy=rnd();d=hyp(dx,dy)}
       const k=(L*0.78-d)/d*0.5*0.4;a.x-=dx*k;a.y-=dy*k;c.x+=dx*k;c.y+=dy*k}}}
 /* Constructive layout: exact bond lengths and ideal angles, keeping the drawing's orientation and handedness. */
+let LAYOUT_FRESH=false; /* true while laying out a structure that has no real drawing yet (SMILES import): placement then avoids overlaps instead of following old positions */
 function layoutComp(comp,rings){
-  const set=new Set(comp.map(a=>a.id)),old={},NEW={},TAU=2*PI,done=new Set(),queue=[];
+  const fresh=LAYOUT_FRESH,set=new Set(comp.map(a=>a.id)),old={},NEW={},TAU=2*PI,done=new Set(),queue=[];
   for(const a of comp)old[a.id]={x:a.x,y:a.y};
   const myRings=rings.filter(r=>set.has(r[0]));
   const ang=(p,q)=>Math.atan2(q.y-p.y,q.x-p.x),n2=a=>{a%=TAU;return a<0?a+TAU:a},snap=a=>Math.round(a/(PI/6))*(PI/6);
   const place=(id,x,y)=>{NEW[id]={x,y};queue.push(id)};
   const wind=r=>{let s=0;for(let i=0;i<r.length;i++){const p=old[r[i]],q=old[r[(i+1)%r.length]];s+=p.x*q.y-q.x*p.y}return s>=0?1:-1};
   const cenOld=r=>({x:r.reduce((s,i)=>s+old[i].x,0)/r.length,y:r.reduce((s,i)=>s+old[i].y,0)/r.length});
-  const polygon=(r,cx,cy,i0,a0)=>{const n=r.length,R=L/(2*Math.sin(PI/n)),w=wind(r);
+  const polygon=(r,cx,cy,i0,a0,wo)=>{const n=r.length,R=L/(2*Math.sin(PI/n)),w=wo||wind(r);
     for(let k=0;k<n;k++){const i=(i0+k)%n;if(!NEW[r[i]]){const a=a0+w*k*TAU/n;place(r[i],cx+R*Math.cos(a),cy+R*Math.sin(a))}}done.add(r)};
   const isLin=a=>{const ns=nbrs(a);return ns.length===2&&(ns.some(k=>k.b.o===3)||ns.filter(k=>k.b.o===2).length===2)};
   const adjIn=(r,x,y)=>{const i=r.indexOf(x),j=r.indexOf(y),n=r.length;return i>=0&&j>=0&&(Math.abs(i-j)===1||Math.abs(i-j)===n-1)};
@@ -1923,23 +1924,45 @@ function layoutComp(comp,rings){
       if(i0<0)return false;
       const u=r[i0],v=r[(i0+1)%n],U=NEW[u],V=NEW[v],mid={x:(U.x+V.x)/2,y:(U.y+V.y)/2},ux=V.x-U.x,uy=V.y-U.y,ul=hyp(ux,uy)||1,nn={x:-uy/ul,y:ux/ul};
       const co=cenOld(r),om={x:(old[u].x+old[v].x)/2,y:(old[u].y+old[v].y)/2},on={x:-(old[v].y-old[u].y),y:old[v].x-old[u].x};
-      const s=Math.sign((co.x-om.x)*on.x+(co.y-om.y)*on.y)||1,apo=L/(2*Math.tan(PI/n)),C={x:mid.x+nn.x*s*apo,y:mid.y+nn.y*s*apo};
-      polygon(r,C.x,C.y,i0,ang(C,U));return true}
+      let s=Math.sign((co.x-om.x)*on.x+(co.y-om.y)*on.y)||1;const apo=L/(2*Math.tan(PI/n)),cand=sg=>({x:mid.x+nn.x*sg*apo,y:mid.y+nn.y*sg*apo});
+      if(fresh){const inR=new Set(r.map(String)),sc=sg=>{const C=cand(sg);let t=0;for(const q in NEW){if(inR.has(q))continue;const d=hyp(NEW[q].x-C.x,NEW[q].y-C.y);t+=1/(d*d+1)}return t};s=sc(1)<=sc(-1)?1:-1}
+      const C=cand(s),w=Math.sign((U.x-C.x)*(V.y-C.y)-(U.y-C.y)*(V.x-C.x))||1;
+      polygon(r,C.x,C.y,i0,ang(C,U),w);return true}
     if(pl.length===1){const a=S.o[pl[0]],pa=NEW[a.id],i0=r.indexOf(a.id),R=L/(2*Math.sin(PI/n)),h=ang(old[a.id],cenOld(r));
       const occ=nbrs(a).filter(q=>NEW[q.n.id]).map(q=>ang(pa,NEW[q.n.id]));let dir;
       if(!occ.length)dir=snap(h);else{const sx=occ.reduce((s,t)=>s+Math.cos(t),0),sy=occ.reduce((s,t)=>s+Math.sin(t),0);dir=hyp(sx,sy)>0.2?Math.atan2(-sy,-sx):freeAngles(a,[h])[0]}
       const C={x:pa.x+R*Math.cos(dir),y:pa.y+R*Math.sin(dir)};polygon(r,C.x,C.y,i0,ang(C,pa));return true}
     return false}
-  if(myRings.length){const r0=myRings[0],c=cenOld(r0);polygon(r0,c.x,c.y,0,snap(ang(c,old[r0[0]])))}
+  if(myRings.length){const r0=myRings[0],c=cenOld(r0);polygon(r0,c.x,c.y,0,snap(ang(c,old[r0[0]])),fresh?1:0)}
   else{const a0=comp.reduce((b,a)=>nbrs(a).length>nbrs(b).length?a:b,comp[0]);place(a0.id,old[a0.id].x,old[a0.id].y)}
   for(let guard=0;guard<20000;guard++){
     if(!queue.length){const left=comp.find(a=>!NEW[a.id]);if(!left)break;place(left.id,old[left.id].x,old[left.id].y)}
     const aid=queue.shift(),a=S.o[aid];
     for(const k of nbrs(a)){if(NEW[k.n.id])continue;const r=myRings.find(r=>!done.has(r)&&adjIn(r,aid,k.n.id));if(r)tryRing(r)}
     const rest=nbrs(a).filter(k=>!NEW[k.n.id]);
-    if(rest.length){const as=freeAngles(a,rest.map(k=>ang(old[a.id],old[k.n.id])));
+    if(rest.length){let as=freeAngles(a,rest.map(k=>ang(old[a.id],old[k.n.id])));
+      if(fresh){const pa=NEW[a.id],occN=nbrs(a).filter(q=>NEW[q.n.id]),cands=[as];
+        if(rest.length===1&&occN.length===1){const o=ang(pa,NEW[occN[0].n.id]),t=isLin(a)?PI:TAU/3;cands.push([o+t],[o-t])}else if(rest.length>1)cands.push(as.slice().reverse());
+        let turnO=0;if(rest.length===1&&occN.length===1){const O=occN[0].n,pp=nbrs(O).find(q=>NEW[q.n.id]&&q.n.id!==a.id);if(pp){const P=NEW[pp.n.id],Q=NEW[O.id];turnO=Math.sign((Q.x-P.x)*(pa.y-Q.y)-(Q.y-P.y)*(pa.x-Q.x))}}
+        const score=c=>{let t=0;c.forEach(th=>{const x=pa.x+L*Math.cos(th),y=pa.y+L*Math.sin(th);for(const q in NEW){if(q==a.id)continue;const d=hyp(NEW[q].x-x,NEW[q].y-y);t+=1/(d*d+1)}
+          if(turnO){const q0=NEW[occN[0].n.id],tn=Math.sign((pa.x-q0.x)*Math.sin(th)-(pa.y-q0.y)*Math.cos(th));if(tn===turnO)t+=0.35}});return t};
+        let bs=Infinity;for(const c of cands){const t=score(c);if(t<bs-1e-9){bs=t;as=c}}}
       rest.forEach((k,i)=>place(k.n.id,NEW[a.id].x+L*Math.cos(as[i]),NEW[a.id].y+L*Math.sin(as[i])))}}
-  return NEW}
+  if(fresh)untangle();
+  return NEW;
+  /* flip the branch on one side of a chain bond (mirror it across that bond) when that removes overlaps */
+  function untangle(){
+    const ids=comp.map(a=>a.id),idx=new Map(ids.map((id,i)=>[id,i])),n=ids.length,bonded=new Set();
+    const adj=ids.map(()=>[]);for(const id of ids)for(const k of nbrs(S.o[id])){const i=idx.get(id),j=idx.get(k.n.id);if(j===undefined)continue;adj[i].push(j);bonded.add(i*n+j)}
+    const X=ids.map(id=>NEW[id].x),Y=ids.map(id=>NEW[id].y);
+    const energy=()=>{let e=0;for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){if(bonded.has(i*n+j))continue;const d=hyp(X[i]-X[j],Y[i]-Y[j]);if(d<1.3*L){const t=(1.3*L-d)/L;e+=t*t*(d<0.6*L?4:1)}}return e};
+    const flips=[];for(let i=0;i<n;i++)for(const j of adj[i]){if(i>=j)continue;if(myRings.some(r=>adjIn(r,ids[i],ids[j])))continue;
+      for(const [u,v] of [[i,j],[j,i]]){const side=[],seen=new Set([u]);const st=[v];seen.add(v);while(st.length){const x=st.pop();side.push(x);for(const y of adj[x])if(!seen.has(y)){seen.add(y);st.push(y)}}
+        if(side.length<=n/2&&side.length>1||side.length===1&&false)flips.push({u,v,side});else if(side.length===1)flips.push({u,v,side})}}
+    const apply=f=>{const ux=X[f.u],uy=Y[f.u],dx=X[f.v]-ux,dy=Y[f.v]-uy,dl=hyp(dx,dy)||1,ex=dx/dl,ey=dy/dl;
+      for(const k of f.side){const px=X[k]-ux,py=Y[k]-uy,along=px*ex+py*ey,perp=-px*ey+py*ex;X[k]=ux+along*ex+perp*ey;Y[k]=uy+along*ey-perp*ex}};
+    let e=energy();for(let it=0;it<40&&e>1e-6;it++){let best=null,be=e;for(const f of flips){apply(f);const e2=energy();apply(f);if(e2<be-1e-6){be=e2;best=f}}if(!best)break;apply(best);e=be}
+    ids.forEach((id,i)=>{NEW[id]={x:X[i],y:Y[i]}})}}
 function cleanUp(quiet){
   const comps=components();if(!comps.length){flashHint('Nothing to fix yet. Draw a structure first.');return}
   const touched=new Set();for(const id of sel){const o=S.o[id];if(!o)continue;if(o.t==='a')touched.add(id);else if(o.t==='b'){touched.add(o.a);touched.add(o.b)}}

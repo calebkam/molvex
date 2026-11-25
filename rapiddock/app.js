@@ -740,18 +740,18 @@ async function selfCheck(opt = {}) {
       const res = await Dock.dockLigand(d, G, { runs, effort, modes: A.o.modes, range: A.o.rangeKJ / 4.184, seed }, { progress: f => { A.progress.lig = f; prog(); conProgress(f); }, cancelled: () => A.cancel });
       const rm = res.modes.map(m => Dock.symRmsd(d, m.pos, l.ref)), bst = Math.min(...rm);
       const at = { n: k + 1, runs, effort, seed, top: rm[0], best: bst, bestRank: rm.indexOf(bst) + 1, kcal: res.modes[0].kcal, time: (performance.now() - t1) / 1000, poses: res.modes.length };
-      attempts.push(at); results.push(res); pass = at.top <= RMSD_LIMIT;
-      clog('  best pose RMSD ' + at.top.toFixed(2) + ' Å, lowest of ' + at.poses + ' poses ' + at.best.toFixed(2) + ' Å (pose ' + at.bestRank + '), score ' + at.kcal.toFixed(2) + ' kcal/mol, ' + at.time.toFixed(0) + ' s', pass ? 'ok' : 'err');
-      if (!pass && k < SC_MAX - 1) clog('  RMSD is above ' + RMSD_LIMIT + ' Å, so the search is rerun with a new seed (up to ' + SC_MAX + ' attempts).');
+      attempts.push(at); results.push(res); pass = at.best <= RMSD_LIMIT;
+      clog('  closest pose RMSD ' + at.best.toFixed(2) + ' Å (pose ' + at.bestRank + ' of ' + at.poses + '), top-scoring pose ' + at.top.toFixed(2) + ' Å, score of top pose ' + at.kcal.toFixed(2) + ' kcal/mol, ' + at.time.toFixed(0) + ' s', pass ? 'ok' : 'err');
+      if (!pass && k < SC_MAX - 1) clog('  No pose is within ' + RMSD_LIMIT + ' Å, so the search is rerun with a new seed (up to ' + SC_MAX + ' attempts).');
     }
-    const fi = pass ? attempts.length - 1 : attempts.reduce((a, b, i) => (b.top < attempts[a].top ? i : a), 0), fin = attempts[fi], res = results[fi];
-    l.dock = d; const best = res.modes[0]; best.rank = 1; best.inter = Dock.interactions(d, A.rec, best.pos); best.rmsdRef = fin.top;
+    const fi = pass ? attempts.length - 1 : attempts.reduce((a, b, i) => (b.best < attempts[a].best ? i : a), 0), fin = attempts[fi], res = results[fi];
+    l.dock = d; const best = res.modes[fin.bestRank - 1]; best.inter = Dock.interactions(d, A.rec, best.pos); best.rmsdRef = fin.best;
     A.check = { id: 'selfcheck', lig: l, label: l.label, res: { modes: [best], nrot: res.nrot, runs: res.runs }, limit: RMSD_LIMIT, attempts, pass, fin, time: (performance.now() - t0) / 1000, symmetry: Dock.automorphisms(d).length };
     A.pose = { id: 'selfcheck', mode: 0 };
     try { if (ensureViewer()) { showPose(l, best, true); best.img = A.viewer.snapshot(336, 252); } } catch (e) { console.error(e); }
     status = pass ? 'pass' : 'fail';
-    clog('--- Self-check ' + (pass ? 'PASSED' : 'FAILED') + ': RMSD ' + fin.top.toFixed(2) + ' Å after ' + attempts.length + ' attempt' + (attempts.length > 1 ? 's' : '') + ' ---', pass ? 'ok' : 'err');
-    if (!pass) toast('Self-check failed: the best redocked RMSD was ' + fin.top.toFixed(2) + ' Å after ' + attempts.length + ' attempts. Check the target preparation, protonation and the box.', 8000);
+    clog('--- Self-check ' + (pass ? 'PASSED' : 'FAILED') + ': RMSD ' + fin.best.toFixed(2) + ' Å after ' + attempts.length + ' attempt' + (attempts.length > 1 ? 's' : '') + ' ---', pass ? 'ok' : 'err');
+    if (!pass) toast('Self-check failed: the closest redocked pose was ' + fin.best.toFixed(2) + ' Å after ' + attempts.length + ' attempts. Check the target preparation, protonation and the box.', 8000);
   } catch (e) { conProgress(-1); if (e.message === 'cancelled') { status = 'cancelled'; toast('Self-check cancelled.'); } else { console.error(e); toast('Self-check failed: ' + e.message, 7000); } }
   A.running = false; conProgress(-1); conTouch(); refreshAll(); return status;
 }
@@ -760,7 +760,7 @@ function viewSelfCheck() { A.pose = { id: 'selfcheck', mode: 0 }; go('res'); }
 function selfCheckBanner() {
   const c = A.check;
   if (!c) return h('div', { cls: 'scb none' }, h('span', { cls: 'scb-t', text: 'DOCKING SELF CHECK: not run' }), h('button', { cls: 'btn sm', type: 'button', text: 'Run it', disabled: A.running || !scCandidates().length, on: { click: async () => { await selfCheck(); renderPanel(); } } }));
-  return h('div', { cls: 'scb ' + (c.pass ? 'pass' : 'fail') }, h('div', { cls: 'scb-t', text: 'DOCKING SELF CHECK: RMSD = ' + c.fin.top.toFixed(2) + ' Angstroms' }),
+  return h('div', { cls: 'scb ' + (c.pass ? 'pass' : 'fail') }, h('div', { cls: 'scb-t', text: 'DOCKING SELF CHECK: RMSD = ' + c.fin.best.toFixed(2) + ' Angstroms' }),
     h('div', { cls: 'sub', style: 'white-space:normal', text: (c.pass ? 'PASS' : 'FAIL') + ' (limit ' + c.limit + ' Å) · ' + c.label + ' taken from the structure and redocked · ' + c.attempts.length + ' attempt' + (c.attempts.length > 1 ? 's' : '') }));
 }
 /* The best pose only, shown like any other docking result, at the top of the results. Click to view it in 3D with the crystal pose in grey. */
@@ -769,14 +769,14 @@ function selfCheckPoseCard() {
   return h('div', { cls: 'sec' }, h('h3', { text: 'Self-check · ' + c.label }),
     h('div', { cls: 'modes' }, h('div', { cls: 'mode' + (on ? ' on' : ''), title: 'Click to view this pose in 3D', on: { click: () => { A.pose = { id: 'selfcheck', mode: 0 }; refreshAll(); } } },
       m.img ? h('img', { src: m.img, alt: 'Best redocked pose of ' + c.label }) : h('div'),
-      h('div', {}, h('div', { cls: 'aff' }, uTxt(m), h('small', { text: uName() })), h('div', { cls: 'sub', text: 'Best pose · ' + uAlt(m) }),
-        h('div', { cls: 'sub', text: 'RMSD to crystal ' + m.rmsdRef.toFixed(2) + ' Å · lowest of ' + c.fin.poses + ' poses ' + c.fin.best.toFixed(2) + ' Å' }),
+      h('div', {}, h('div', { cls: 'aff' }, uTxt(m), h('small', { text: uName() })), h('div', { cls: 'sub', text: 'Closest pose to crystal (pose ' + m.rank + ' of ' + c.fin.poses + ') · ' + uAlt(m) }),
+        h('div', { cls: 'sub', text: 'RMSD to crystal ' + m.rmsdRef.toFixed(2) + ' Å · top-scoring pose ' + c.fin.top.toFixed(2) + ' Å' }),
         h('div', { cls: 'sub', text: m.inter.hbonds.length + ' H-bonds · ' + m.inter.hydRes + ' hydrophobic · ' + m.inter.pipi + ' π–π' })))),
     on ? h('p', { cls: 'note', text: 'In the 3D view the redocked pose is coloured and the crystal pose is thin grey.' }) : h('p', { cls: 'note', text: 'Select it to see it in 3D next to the crystal pose.' }));
 }
 function selfCheckCard() {
   const sec = h('div', { cls: 'sec' }, h('h3', { text: 'Model self-check' })), cands = scCandidates(), can = cands.length > 0, cur = cands.find(x => x.id === A.scSel) || cands[0];
-  sec.append(h('p', { cls: 'note', text: 'Takes the ligand that was bound in the PDB structure, redocks it into its own site and measures how far the best pose lands from the crystal pose (heavy atoms, symmetry-aware). If it is above ' + RMSD_LIMIT + ' Å the search is rerun with a different seed, up to ' + SC_MAX + ' attempts. The seed that gave the best result is then used for your docking. Only the best pose is kept and shown at the top of the results.' }));
+  sec.append(h('p', { cls: 'note', text: 'Takes the ligand that was bound in the PDB structure, redocks it into its own site and measures how far the closest of the returned poses lands from the crystal pose (heavy atoms, symmetry-aware), since the scoring function can rank a slightly wrong pose first. If none is within ' + RMSD_LIMIT + ' Å the search is rerun with a different seed, up to ' + SC_MAX + ' attempts. The seed that gave the best result is then used for your docking. Only that pose is kept and shown at the top of the results, with its rank and score.' }));
   if (!can) sec.append(h('p', { cls: 'note', text: 'No ligand was found in the pasted structure. Paste a PDB file that includes the bound ligand (HETATM lines), or load it as an SDF below.' }));
   else if (cands.length > 1) sec.append(h('div', { cls: 'row' }, h('label', { text: 'Ligand' }), h('select', { disabled: A.running, 'aria-label': 'Ligand for the self-check', on: { change: e => { A.scSel = e.target.value; } } }, ...cands.map(x => h('option', { value: x.id, selected: cur && x.id === cur.id, text: x.label })))));
   else sec.append(h('p', { cls: 'sub', style: 'white-space:normal', text: 'Ligand: ' + cur.label + (cur.sub ? ' · ' + cur.sub : '') }));
@@ -786,9 +786,9 @@ function selfCheckCard() {
     h('button', { cls: 'btn', type: 'button', text: 'Load bound ligand (SDF)', disabled: A.running, on: { click: () => inp.click() } }), inp));
   sec.append(h('label', { cls: 'chk' }, h('input', { type: 'checkbox', checked: !!A.o.selfFirst, disabled: A.running, on: { change: e => { A.o.selfFirst = e.target.checked; } } }), h('span', { text: 'Run the self-check before every docking' })));
   const c = A.check; if (!c) return sec;
-  sec.append(h('div', { cls: 'chk-res' }, h('div', { cls: 'row', style: 'gap:8px' }, h('span', { cls: 'chip ' + (c.pass ? 'ok' : 'no'), text: c.pass ? 'PASS' : 'FAIL' }), h('span', { cls: 'aff', text: c.fin.top.toFixed(2), }), h('span', { cls: 'sub', text: 'Å RMSD, best pose · limit ' + c.limit + ' Å' })),
-    h('p', { cls: 'sub', style: 'white-space:normal;margin-top:4px', text: c.label + ' redocked. Lowest of ' + c.fin.poses + ' poses: ' + c.fin.best.toFixed(2) + ' Å (pose ' + c.fin.bestRank + '). ' + c.attempts.length + ' attempt' + (c.attempts.length > 1 ? 's' : '') + ', ' + c.time.toFixed(0) + ' s' + (c.symmetry > 1 ? ', ' + c.symmetry + ' symmetry-equivalent atom mappings checked' : '') + '.' }),
-    c.attempts.length > 1 ? h('table', { cls: 'vtab', style: 'margin-top:6px' }, h('thead', {}, h('tr', {}, h('th', { text: 'Attempt' }), h('th', { cls: 'num', text: 'Runs' }), h('th', { cls: 'num', text: 'Best pose' }), h('th', { cls: 'num', text: 'Lowest' }))),
+  sec.append(h('div', { cls: 'chk-res' }, h('div', { cls: 'row', style: 'gap:8px' }, h('span', { cls: 'chip ' + (c.pass ? 'ok' : 'no'), text: c.pass ? 'PASS' : 'FAIL' }), h('span', { cls: 'aff', text: c.fin.best.toFixed(2), }), h('span', { cls: 'sub', text: 'Å RMSD, closest pose · limit ' + c.limit + ' Å' })),
+    h('p', { cls: 'sub', style: 'white-space:normal;margin-top:4px', text: c.label + ' redocked. Closest of ' + c.fin.poses + ' poses is pose ' + c.fin.bestRank + ' (' + c.fin.best.toFixed(2) + ' Å); the top-scoring pose is ' + c.fin.top.toFixed(2) + ' Å. ' + c.attempts.length + ' attempt' + (c.attempts.length > 1 ? 's' : '') + ', ' + c.time.toFixed(0) + ' s' + (c.symmetry > 1 ? ', ' + c.symmetry + ' symmetry-equivalent atom mappings checked' : '') + '.' }),
+    c.attempts.length > 1 ? h('table', { cls: 'vtab', style: 'margin-top:6px' }, h('thead', {}, h('tr', {}, h('th', { text: 'Attempt' }), h('th', { cls: 'num', text: 'Runs' }), h('th', { cls: 'num', text: 'Top-scoring' }), h('th', { cls: 'num', text: 'Closest' }))),
       h('tbody', {}, ...c.attempts.map(a => h('tr', {}, h('td', { text: String(a.n) }), h('td', { cls: 'num', text: String(a.runs) }), h('td', { cls: 'num', text: a.top.toFixed(2) + ' Å' }), h('td', { cls: 'num', text: a.best.toFixed(2) + ' Å' }))))) : null,
     c.pass ? null : h('p', { cls: 'warn', style: 'margin-top:6px', text: 'Even the larger searches stayed above the limit. Typical causes: wrong protonation or missing waters or cofactors in the target, a box that is too small, or a ligand that is not the one in this structure.' })));
   return sec;
